@@ -1,0 +1,15 @@
+#py -3.11 -m venv venv --- ESTO SOLO LA PRIMERA VEZ PARA CREAR LA CARPETA VENV
+#venv\Scripts\activate
+#pip install -r requirements.txt
+#MIRAR SI TENGO QUE AÑADIR AQUI LO DE DUNE (pip install noseque de dune)
+pandas==2.2.0
+numpy==1.26.0
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+python-dotenv==1.0.0
+jupyter==1.0.0
+scikit-learn==1.4.0
+xgboost==2.0.3
+streamlit==1.31.0
+plotly==5.18.0
+requests==2.31.0
