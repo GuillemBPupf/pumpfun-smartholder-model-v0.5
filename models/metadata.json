@@ -1,0 +1,31 @@
+{
+  "features": [
+    "n_early_buyers",
+    "n_reliable_wallets",
+    "avg_wallet_score",
+    "max_wallet_score",
+    "pct_high_score_wallets",
+    "pct_negative_wallets",
+    "pct_new_wallets",
+    "avg_cooccurrence_score",
+    "total_volume_sol",
+    "avg_buy_size_sol",
+    "std_buy_size_sol",
+    "concentration_top5",
+    "n_tier1_buyers",
+    "creator_is_buyer",
+    "buys_in_first_20s",
+    "buys_20s_to_60s",
+    "buys_60s_to_180s",
+    "acceleration_ratio",
+    "time_to_5th_buy",
+    "hour_utc",
+    "day_of_week"
+  ],
+  "categorical_cols": [
+    "hour_utc",
+    "day_of_week",
+    "creator_is_buyer"
+  ],
+  "trained_at": "2026-03-29T18:48:13.685429+00:00"
+}
