@@ -22,10 +22,6 @@
     "hour_utc",
     "day_of_week"
   ],
-  "categorical_cols": [
-    "hour_utc",
-    "day_of_week",
-    "creator_is_buyer"
-  ],
-  "trained_at": "2026-03-29T18:48:13.685429+00:00"
+  "train_ratio": 0.8,
+  "trained_at": "2026-03-30T13:08:10.869053+00:00"
 }
