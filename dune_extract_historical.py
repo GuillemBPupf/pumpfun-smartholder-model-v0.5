@@ -397,7 +397,6 @@ def main():
         if i < len(days) - 1:
             time.sleep(PAUSE_BETWEEN_DAYS)
 
-    # Consolidar
     log.info("\nConsolidando archivos...")
     out_trades = consolidate(DIR_TRADES, "trades")
     out_prices = consolidate(DIR_PRICES, "prices")
@@ -408,6 +407,7 @@ def main():
     log.info(f"  Días OK          : {dias_ok}/{len(days)}")
     log.info(f"  Total trades     : {total_trades:,}")
     log.info(f"  Total prices     : {total_prices:,}")
+
     if out_trades:
         df_t = pd.read_csv(out_trades)
         log.info(f"  Trades únicos    : {len(df_t):,}")
