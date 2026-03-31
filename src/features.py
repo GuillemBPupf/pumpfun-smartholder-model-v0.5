@@ -7,6 +7,7 @@ Versión vectorizada + sin data leakage:
   - Split temporal compartido con wallet_scoring y model via splitter.py
   - Co-ocurrencia calculada SOLO con coins exitosas de train
   - Wallet scores ya calculados solo sobre train (wallet_scoring.py)
+  - Co-ocurrencia por coin calculada en LOTES para evitar explosión de RAM
 
 Uso:
     python src/features.py
@@ -90,7 +91,14 @@ def compute_cooccurrence(
     """
     Matriz de co-ocurrencia construida SOLO con coins exitosas de train.
     Se aplica a todas las coins (train + test) sin leakage.
+
+    Para evitar explosión de RAM con datasets grandes:
+      - Paso 1: pair_counts solo sobre coins exitosas de train (~2k coins).
+                Manejable porque son pocas coins.
+      - Paso 2: score por coin calculado en lotes de BATCH_SIZE coins,
+                limitando a MAX_WALLETS wallets por coin por volumen.
     """
+    # ── Paso 1: frecuencias de pares en coins exitosas de train ─
     print("  Calculando co-ocurrencias (solo sobre coins exitosas de train)...")
 
     successful_train = set(
@@ -106,6 +114,7 @@ def compute_cooccurrence(
         print("    Sin coins exitosas en train.")
         return pd.Series(dtype=float)
 
+    # Self-join solo sobre ~2k coins exitosas — completamente manejable
     pairs = eb_success.merge(
         eb_success, on="coin_address", suffixes=("_a", "_b")
     )
@@ -121,30 +130,57 @@ def compute_cooccurrence(
     )
     print(f"    {len(pair_counts):,} pares únicos con co-ocurrencia > 0")
 
-    # Aplicar a TODAS las coins
-    all_coins  = eb[["coin_address", "wallet_address"]].drop_duplicates()
-    coin_pairs = all_coins.merge(
-        all_coins, on="coin_address", suffixes=("_a", "_b")
-    )
-    coin_pairs = coin_pairs[
-        coin_pairs["wallet_address_a"] < coin_pairs["wallet_address_b"]
-    ]
+    # ── Paso 2: score por coin en lotes ────────────────────────
+    # Limitar a top MAX_WALLETS wallets por coin (por volumen SOL)
+    # para que el self-join por lote no explote en RAM
+    MAX_WALLETS = 25
+    BATCH_SIZE  = 3_000
 
-    if coin_pairs.empty:
+    eb_limited = (
+        eb.sort_values("total_sol_spent", ascending=False)
+        .groupby("coin_address")
+        .head(MAX_WALLETS)[["coin_address", "wallet_address"]]
+        .drop_duplicates()
+    )
+
+    all_coins   = eb_limited["coin_address"].unique()
+    score_parts = []
+
+    for start in range(0, len(all_coins), BATCH_SIZE):
+        batch_coins = all_coins[start:start + BATCH_SIZE]
+        batch_eb    = eb_limited[eb_limited["coin_address"].isin(batch_coins)]
+
+        # Self-join dentro del lote: máx 3000 × 25 × 25/2 ≈ 937k filas
+        batch_pairs = batch_eb.merge(
+            batch_eb, on="coin_address", suffixes=("_a", "_b")
+        )
+        batch_pairs = batch_pairs[
+            batch_pairs["wallet_address_a"] < batch_pairs["wallet_address_b"]
+        ]
+
+        if batch_pairs.empty:
+            continue
+
+        # Lookup vectorizado contra pair_counts
+        batch_pairs = batch_pairs.merge(
+            pair_counts,
+            on=["wallet_address_a", "wallet_address_b"],
+            how="left"
+        )
+        batch_pairs["cooc_count"] = batch_pairs["cooc_count"].fillna(0)
+
+        coin_scores = (
+            batch_pairs.groupby("coin_address")["cooc_count"]
+            .mean()
+        )
+        score_parts.append(coin_scores)
+
+    if not score_parts:
         return pd.Series(dtype=float)
 
-    coin_pairs = coin_pairs.merge(
-        pair_counts, on=["wallet_address_a", "wallet_address_b"], how="left"
-    )
-    coin_pairs["cooc_count"] = coin_pairs["cooc_count"].fillna(0)
-
-    cooc_score = (
-        coin_pairs.groupby("coin_address")["cooc_count"]
-        .mean()
-        .rename("avg_cooccurrence_score")
-    )
-    print(f"    Co-ocurrencia calculada para {len(cooc_score):,} coins")
-    return cooc_score
+    result = pd.concat(score_parts).rename("avg_cooccurrence_score")
+    print(f"    Co-ocurrencia calculada para {len(result):,} coins")
+    return result
 
 
 # ── Features vectorizadas ──────────────────────────────────────
