@@ -5,15 +5,40 @@ Calcula el performance_score de cada wallet usando SOLO su historial
 en el conjunto de entrenamiento (train_coins), evitando data leakage.
 
 Fórmula del score:
-  roi_capeado    = min(max_multiple, 10)  por cada coin
-  avg_roi_capped = media de roi_capeado
 
-  base_score   = win_rate * 0.80 + min(avg_roi_capped / 5, 1) * 0.20
-  penalización = negative_rate * 0.30
-  score final  = max(0, base_score - penalización)
+  Paso 1 — Bayesian win rate:
+    bayesian_wr = (wins + PRIOR * global_wr) / (N + PRIOR)
+    Estabiliza wallets con pocas apariciones acercándolas al global.
 
-  Si appearances_total < 5 → score_reliable = FALSE
-    y el score se fuerza a 0.1 (neutro)
+  Paso 2 — Lift sobre baseline:
+    lift = bayesian_win_rate / global_win_rate
+    Una wallet promedio tiene lift = 1.0.
+    lift >= MAX_LIFT → win_component = 1.0
+
+  Paso 3 — Conviction ratio:
+    ratio entre el SOL medio apostado en coins ganadoras vs perdedoras.
+    > 1.0 → pone más dinero cuando acierta → señal de conocimiento real.
+
+  Paso 4 — Score final:
+    win_component        = clip(lift / MAX_LIFT, 0, 1)
+    roi_component        = clip(avg_roi_capped / 5.0, 0, 1)
+    entry_component      = clip(1 - avg_entry_seconds / 180, 0, 1)
+    conviction_component = clip((conviction_ratio - 1) / 3, 0, 1)
+
+    base_score = (win_component        * 0.50
+               + roi_component         * 0.20
+               + entry_component       * 0.15
+               + conviction_component  * 0.15)
+    penalización = negative_rate * PENALIZATION
+    score = clip(base_score - penalización, 0, 1)
+
+Parámetros:
+    ROI_CAP         = 10.0   → cap por coin antes de media
+    PRIOR_STRENGTH  = 5      → pseudo-observaciones Bayesian
+    MAX_LIFT        = 8.0    → lift en que win_component = 1.0
+                               Con baseline 5%, win_rate ~40% ya satura.
+    PENALIZATION    = 0.20   → peso de la penalización por rugs
+    MIN_APPEARANCES = 5      → mínimo para score_reliable = TRUE
 
 Uso:
     python src/wallet_scoring.py
@@ -30,15 +55,16 @@ from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
-# Añadir src/ al path para importar splitter
 sys.path.insert(0, os.path.dirname(__file__))
 from splitter import get_train_test_coins
 
 load_dotenv()
 
-ROI_CAP        = 10.0
+ROI_CAP         = 10.0
 MIN_APPEARANCES = 5
-NEUTRAL_SCORE  = 0.1
+PRIOR_STRENGTH  = 5
+MAX_LIFT        = 8.0
+PENALIZATION    = 0.20
 
 
 # ── Conexión ───────────────────────────────────────────────────
@@ -55,14 +81,17 @@ def get_engine():
 
 def load_data(engine, train_coins: set) -> pd.DataFrame:
     """
-    Carga el cruce entre early_buyers y coin_prices,
-    SOLO para coins del conjunto de entrenamiento.
+    Carga early_buyers + coin_prices SOLO para coins de train.
+    Incluye first_entry_seconds y total_sol_spent para los nuevos scores.
     """
     print("  Cargando datos de early_buyers + coin_prices (solo train)...")
     df = pd.read_sql("""
         SELECT
             eb.wallet_address,
             eb.coin_address,
+            eb.first_entry_seconds,
+            eb.total_sol_spent,
+            eb.tier,
             cp.label,
             cp.max_multiple,
             cp.rug_detected,
@@ -73,7 +102,6 @@ def load_data(engine, train_coins: set) -> pd.DataFrame:
         WHERE cp.label IS NOT NULL
     """, engine)
 
-    # Filtrar solo coins de train
     before = len(df)
     df     = df[df["coin_address"].isin(train_coins)]
     print(f"  {len(df):,} filas (de {before:,} totales) | "
@@ -83,11 +111,6 @@ def load_data(engine, train_coins: set) -> pd.DataFrame:
 
 
 def load_first_seen(engine) -> pd.DataFrame:
-    """
-    Timestamp de la primera aparición de cada wallet
-    (sobre TODAS sus apariciones, no solo train — esto no es leakage
-    porque es solo metadata temporal, no resultado de la coin).
-    """
     return pd.read_sql("""
         SELECT
             eb.wallet_address,
@@ -101,15 +124,29 @@ def load_first_seen(engine) -> pd.DataFrame:
 # ── Cálculo de métricas ────────────────────────────────────────
 
 def calculate_metrics(df: pd.DataFrame) -> pd.DataFrame:
+
+    # ── Baseline del train set ────────────────────────────────
+    global_win_rate = df["label"].mean()
+    global_neg_rate = df["rug_detected"].mean()
+    print(f"  Win rate global (train):   {global_win_rate:.4f}  "
+          f"({global_win_rate:.1%})")
+    print(f"  Rug rate global (train):   {global_neg_rate:.4f}  "
+          f"({global_neg_rate:.1%})")
+
+    # ── Cap de ROI ────────────────────────────────────────────
     print("  Aplicando cap de ROI por coin...")
+    df = df.copy()
     df["roi_capped"] = df["max_multiple"].clip(upper=ROI_CAP).fillna(1.0)
 
+    # ── Métricas base por wallet ──────────────────────────────
     print("  Calculando métricas por wallet (sobre datos de train)...")
+
     base = df.groupby("wallet_address").agg(
         appearances_total = ("coin_address", "count"),
-        win_rate          = ("label",        "mean"),
+        wins              = ("label",        "sum"),
         negative_rate     = ("rug_detected", "mean"),
     ).reset_index()
+    base["win_rate"] = base["wins"] / base["appearances_total"]
 
     avg_roi = (
         df.groupby("wallet_address")["roi_capped"]
@@ -117,28 +154,114 @@ def calculate_metrics(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
         .rename(columns={"roi_capped": "avg_roi_capped"})
     )
+    base = base.merge(avg_roi, on="wallet_address", how="left")
+    base["avg_roi_capped"] = base["avg_roi_capped"].fillna(1.0)
 
-    metrics = base.merge(avg_roi, on="wallet_address", how="left")
-    metrics["avg_roi_capped"] = metrics["avg_roi_capped"].fillna(1.0)
+    # ── Velocidad de entrada ──────────────────────────────────
+    # Wallets que entran antes tienen ventaja de información.
+    # entry_component = 1.0 si avg_entry_seconds = 0
+    #                 = 0.0 si avg_entry_seconds = 180
+    print("  Calculando velocidad de entrada...")
+    entry_stats = df.groupby("wallet_address").agg(
+        avg_entry_seconds = ("first_entry_seconds", "mean"),
+        pct_tier1_entries = ("tier", lambda x: (x == 1).mean()),
+    ).reset_index()
+    base = base.merge(entry_stats, on="wallet_address", how="left")
+    base["avg_entry_seconds"] = base["avg_entry_seconds"].fillna(90.0)
+    base["pct_tier1_entries"] = base["pct_tier1_entries"].fillna(0.0)
 
-    print("  Calculando scores...")
-    componente_roi = np.minimum(metrics["avg_roi_capped"] / 5.0, 1.0)
-    base_score     = metrics["win_rate"] * 0.80 + componente_roi * 0.20
-    penalizacion   = metrics["negative_rate"] * 0.30
-    raw_score      = (base_score - penalizacion).clip(lower=0.0, upper=1.0)
+    # ── Conviction ratio ──────────────────────────────────────
+    # Ratio SOL medio en winners vs SOL medio en losers.
+    # Si la wallet pone sistemáticamente más dinero cuando acierta,
+    # indica criterio real, no suerte.
+    #   conviction_ratio > 1.0 → apuesta más en ganadores (buena señal)
+    #   conviction_ratio = 1.0 → neutral
+    #   conviction_ratio < 1.0 → apuesta más en perdedores (mala señal)
+    print("  Calculando conviction ratio...")
 
-    metrics["score_reliable"]    = metrics["appearances_total"] >= MIN_APPEARANCES
-    metrics["performance_score"] = np.where(
-        metrics["score_reliable"], raw_score, NEUTRAL_SCORE
+    sol_by_outcome = (
+        df.groupby(["wallet_address", "label"])["total_sol_spent"]
+        .mean()
+        .unstack()
     )
+    sol_by_outcome.columns = ["avg_sol_loss", "avg_sol_win"]
+    sol_by_outcome = sol_by_outcome.reset_index()
+    sol_by_outcome["avg_sol_win"]  = sol_by_outcome["avg_sol_win"].fillna(0.0)
+    sol_by_outcome["avg_sol_loss"] = sol_by_outcome["avg_sol_loss"].fillna(0.0)
 
-    reliable = metrics[metrics["score_reliable"]]
+    sol_by_outcome["conviction_ratio"] = np.where(
+        sol_by_outcome["avg_sol_loss"] > 0,
+        (sol_by_outcome["avg_sol_win"] /
+         sol_by_outcome["avg_sol_loss"]).clip(0.0, 10.0),
+        1.0   # sin losers → neutral (no penalizar)
+    )
+    # Sin winners → convicción no demostrada
+    sol_by_outcome.loc[
+        sol_by_outcome["avg_sol_win"] == 0, "conviction_ratio"
+    ] = 0.5
+
+    base = base.merge(
+        sol_by_outcome[["wallet_address", "conviction_ratio"]],
+        on="wallet_address", how="left"
+    )
+    base["conviction_ratio"] = base["conviction_ratio"].fillna(1.0)
+
+    # ── Bayesian win rate y lift ──────────────────────────────
+    print("  Calculando Bayesian win rate y lift...")
+    alpha = PRIOR_STRENGTH * global_win_rate
+    base["bayesian_win_rate"] = (
+        (base["wins"] + alpha) /
+        (base["appearances_total"] + PRIOR_STRENGTH)
+    )
+    base["win_lift"] = base["bayesian_win_rate"] / global_win_rate
+
+    # ── Componentes del score ─────────────────────────────────
+    print("  Calculando scores...")
+
+    # win: con MAX_LIFT=8 y baseline ~5%, una wallet con ~40%
+    #      de win rate ya satura este componente.
+    win_component = (base["win_lift"] / MAX_LIFT).clip(0.0, 1.0)
+
+    # roi: 5x capeado = máximo
+    roi_component = (base["avg_roi_capped"] / 5.0).clip(0.0, 1.0)
+
+    # entry: cuanto antes entra, mayor el componente
+    entry_component = (
+        1.0 - base["avg_entry_seconds"] / 180.0
+    ).clip(0.0, 1.0)
+
+    # conviction: ratio=1 → 0.0, ratio=4 → 1.0
+    conviction_component = (
+        (base["conviction_ratio"] - 1.0) / 3.0
+    ).clip(0.0, 1.0)
+
+    penalization = base["negative_rate"] * PENALIZATION
+
+    raw_score = (
+        win_component        * 0.65 +
+        roi_component        * 0.20 +
+        entry_component      * 0.05 +
+        conviction_component * 0.10 -
+        penalization
+    ).clip(0.0, 1.0)
+
+    base["score_reliable"]    = base["appearances_total"] >= MIN_APPEARANCES
+    base["performance_score"] = raw_score
+
+    # ── Diagnóstico ───────────────────────────────────────────
+    reliable = base[base["score_reliable"]]
+
     print(f"\n  Diagnóstico wallets fiables ({len(reliable):,}):")
-    print(f"    Win rate medio:        {reliable['win_rate'].mean():.3f}")
-    print(f"    Avg ROI capeado medio: {reliable['avg_roi_capped'].mean():.2f}x")
-    print(f"    Negative rate medio:   {reliable['negative_rate'].mean():.3f}")
+    print(f"    Win rate medio:             {reliable['win_rate'].mean():.3f}")
+    print(f"    Lift medio:                 {reliable['win_lift'].mean():.2f}x")
+    print(f"    Avg ROI capeado medio:      {reliable['avg_roi_capped'].mean():.2f}x")
+    print(f"    Avg entry seconds medio:    {reliable['avg_entry_seconds'].mean():.1f}s")
+    print(f"    Pct tier1 entries medio:    {reliable['pct_tier1_entries'].mean():.1%}")
+    print(f"    Conviction ratio medio:     {reliable['conviction_ratio'].mean():.2f}x")
+    print(f"    Negative rate medio:        {reliable['negative_rate'].mean():.3f}")
+    print(f"    Score medio:                {reliable['performance_score'].mean():.3f}")
 
-    return metrics
+    return base
 
 
 # ── Escritura en base de datos ─────────────────────────────────
@@ -147,8 +270,10 @@ def save_metrics(engine, metrics: pd.DataFrame, first_seen: pd.DataFrame):
     metrics = metrics.merge(first_seen, on="wallet_address", how="left")
     metrics["last_calculated_at"] = datetime.now(timezone.utc)
 
-    for col in ["win_rate", "avg_roi_capped", "negative_rate", "performance_score"]:
-        metrics[col] = metrics[col].round(6)
+    for col in ["win_rate", "avg_roi_capped", "negative_rate",
+                "performance_score"]:
+        if col in metrics.columns:
+            metrics[col] = metrics[col].round(6)
 
     metrics = metrics.rename(columns={"avg_roi_capped": "avg_roi"})
 
@@ -248,11 +373,13 @@ def print_summary(engine):
 
 def main():
     print("=" * 60)
-    print("WALLET SCORING (sin data leakage)")
-    print(f"  ROI cap:        {ROI_CAP}x")
-    print(f"  Pesos:          win_rate=80%, avg_roi_capped=20%")
-    print(f"  Penalización:   negative_rate * 0.30")
-    print(f"  Min apariciones:{MIN_APPEARANCES}")
+    print("WALLET SCORING — lift + Bayesian + entry speed + conviction")
+    print(f"  ROI cap:          {ROI_CAP}x")
+    print(f"  Prior strength:   {PRIOR_STRENGTH} pseudo-observaciones")
+    print(f"  MAX_LIFT:         {MAX_LIFT}x  (~40% win rate satura con baseline 5%)")
+    print(f"  Pesos:            win=50%, roi=20%, entry=15%, conviction=15%")
+    print(f"  Penalización:     negative_rate × {PENALIZATION}")
+    print(f"  Min apariciones:  {MIN_APPEARANCES}  (flag score_reliable)")
     print("=" * 60)
 
     engine = get_engine()

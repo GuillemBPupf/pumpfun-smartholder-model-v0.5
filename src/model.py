@@ -22,7 +22,7 @@ import pandas as pd
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-
+THRESHOLD = 0.5
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -150,7 +150,7 @@ def train_classifier(X_train, X_test, y_train, y_test):
             eval_set=[(X_test, y_test)], verbose=False)
 
     proba_test = clf.predict_proba(X_test)[:, 1]
-    pred_test  = (proba_test >= 0.5).astype(int)
+    pred_test  = (proba_test >= THRESHOLD).astype(int)
 
     print(f"\n  AUC-ROC: {roc_auc_score(y_test, proba_test):.4f}")
     print(f"  AUC-PR:  {average_precision_score(y_test, proba_test):.4f}"
