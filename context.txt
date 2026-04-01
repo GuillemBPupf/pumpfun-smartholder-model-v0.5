@@ -3862,3 +3862,197 @@ A3viaMZUURbJD7hh2aox954DadMFxqSXeaaZrkKcpump,6.447543541473049e-06,1.07996960092
 Hgnr2QR6GGVDzPUf4gvdo2i9sVLVAJchuM9D7cB7pump,1.1734181054611368e-05,1.767377506647499e-05,3.825077081732801e-06,1.6494971866489858e-05,0,0,1.51,False,0
 AC9NkWTUVix1LrUQ5pSxBAgr4ygRqNahYLdgA8Tfpump,1.6407050418765257e-05,0.0003171308120215129,3.686249467630966e-06,1.6904204867334112e-05,0,1,19.33,False,0
 AoP87i9zAnAy4gZubZiqcuieAyw5xGmpgRNYqWZnnyV2,1.2389604858154471e-05,1.553868029988742e-05,3.5148300093224224e-06,1.7621051098871692e-05,0,0,1.25,True,0
+
+
+otra informacion que puede ser interesante:
+
+log despues de haber entrenado el modelo:
+
+(venv) PS C:\Users\guill\Desktop\BLOCKCHAIN_MINING> python .\src\wallet_scoring.py
+============================================================
+WALLET SCORING — lift + Bayesian + entry speed + conviction
+  ROI cap:          10.0x
+  Prior strength:   5 pseudo-observaciones
+  MAX_LIFT:         8.0x  (~40% win rate satura con baseline 5%)
+  Pesos:            win=50%, roi=20%, entry=15%, conviction=15%
+  Penalización:     negative_rate × 0.2
+  Min apariciones:  5  (flag score_reliable)
+============================================================
+
+[0/3] Determinando split temporal...
+  Train: 41,774 coins | Test: 10,444 coins
+
+[1/3] Cargando datos (solo train)...
+  Cargando datos de early_buyers + coin_prices (solo train)...
+  2,698,982 filas (de 3,347,140 totales) | solo 41,774 coins de train
+  320,744 wallets únicas en train
+
+[2/3] Calculando métricas...
+  Win rate global (train):   0.0635  (6.3%)
+  Rug rate global (train):   0.4234  (42.3%)
+  Aplicando cap de ROI por coin...
+  Calculando métricas por wallet (sobre datos de train)...
+  Calculando velocidad de entrada...
+  Calculando conviction ratio...
+  Calculando Bayesian win rate y lift...
+  Calculando scores...
+
+  Diagnóstico wallets fiables (67,504):
+    Win rate medio:             0.063
+    Lift medio:                 0.99x
+    Avg ROI capeado medio:      1.86x
+    Avg entry seconds medio:    70.1s
+    Pct tier1 entries medio:    23.0%
+    Conviction ratio medio:     0.80x
+    Negative rate medio:        0.448
+    Score medio:                0.105
+
+[3/3] Guardando en wallet_metrics...
+
+  Guardando 320,744 wallets en wallet_metrics...
+    320,744 wallets guardadas.
+
+============================================================
+RESUMEN FINAL
+
+  Total wallets:                 320,744
+  Wallets fiables (>=5):           67,504
+  Fiables con score >= 0.5:          184
+  Negative rate > 40%:           170,118
+
+  Distribución de scores:
+    0.0  ██████████████████████  (141,298)
+    0.1  █████████████  (88,935)
+    0.2  ██████████  (69,654)
+    0.3  █  (10,561)
+    0.4    (4,737)
+    0.5    (5,153)
+    0.6    (312)
+    0.7    (80)
+    0.8    (12)
+    0.9    (2)
+
+  Top 10 wallets fiables:
+  wallet               apps   win%     roi   neg%  score
+  -------------------------------------------------------
+  31yfwWmYgbF2axSfz8..   13   0.69    4.14x   0.00  0.880
+  2DDSNzStsMQYfhS1aD..   15   0.60    4.92x   0.00  0.854
+  DyHtfzEB6F1R4QmFYi..   14   0.64    4.34x   0.07  0.840
+  BQzj37kPRXBmkrx7A9..   21   0.62    3.87x   0.14  0.826
+  9w7C3PCGQ5gkKvYCgc..   13   0.62    4.37x   0.00  0.808
+  81dhoF1S5UQXFkZh6L..    8   0.75    4.46x   0.12  0.798
+  8krTDoEPzVV6YtnR3C..    7   0.71    3.71x   0.29  0.795
+  9omZBh9vR218vPzMqM..   16   0.56    4.12x   0.00  0.777
+  4pV6sLvCBCe8u3EK2M..   13   0.54    3.85x   0.00  0.747
+  GLvTmtRfGJBzoRErcY..   15   0.53    4.13x   0.00  0.743
+============================================================
+(venv) PS C:\Users\guill\Desktop\BLOCKCHAIN_MINING> python .\src\features.py
+============================================================
+FEATURES — coin_features (vectorizado, sin leakage)
+============================================================
+
+[1/4] Cargando datos...
+  Cargando early_buyers + wallet_metrics (join en SQL)...
+    8,002,782 filas early_buyers
+  Cargando coin_prices...
+    52,218 coins con label
+  Cargando coins (meta)...
+    2,525,392 coins
+
+[2/4] Determinando split y calculando co-ocurrencias...
+  Train: 41,774 | Test: 10,444
+  Calculando co-ocurrencias (solo sobre coins exitosas de train)...
+    Coins exitosas en train: 2,093
+    11,243,699 pares únicos con co-ocurrencia > 0
+    Co-ocurrencia calculada para 398,975 coins
+
+[3/4] Calculando features...
+  52,218 coins, 3,347,140 filas early_buyers
+  Bloque 1: composición de wallets...
+  Bloque 2: co-ocurrencia...
+  Bloque 3: comportamiento de compra...
+  Creator is buyer...
+  Bloque 4: velocidad de acumulación...
+  Bloque 5: contexto temporal...
+  Uniendo bloques...
+  Features calculadas para 52,218 coins
+
+[4/4] Guardando en coin_features...
+  Guardando 52,218 filas en coin_features...
+    52,218 filas guardadas.
+
+============================================================
+RESUMEN FINAL
+
+  coin_features generadas:   52,218
+  Avg early buyers:          64.1
+  Avg wallet score:          0.1318
+  Avg % wallets nuevas:      20.72%
+  Avg acceleration ratio:    6.27
+  Coins con creator buyer:   5,340
+  Avg co-ocurrencia:         1.8320
+============================================================
+(venv) PS C:\Users\guill\Desktop\BLOCKCHAIN_MINING> python .\src\model.py
+============================================================
+MODEL TRAINING (sin data leakage)
+============================================================
+
+[1/4] Cargando dataset...
+  Dataset: 52,218 filas, 2540 positivos (4.9% tasa de éxito)
+
+[2/4] Preparando datos (split temporal compartido)...
+  Train: 41,774 coins (2025-12-23 00:00:01+00:00 → 2026-01-11 17:36:16+00:00)
+  Test:  10,444 coins (2026-01-11 17:36:22+00:00 → 2026-01-14 23:59:47+00:00)
+  Positivos train: 2093 (5.0%)
+  Positivos test:  447 (4.3%)
+
+[3/4] Entrenando modelos...
+
+  ── Clasificador ──
+  scale_pos_weight: 19.0 (39681 neg / 2093 pos)
+
+  AUC-ROC: 0.6670
+  AUC-PR:  0.0795  ← métrica principal con desbalanceo
+
+  Reporte (umbral 0.5):
+              precision    recall  f1-score   support
+
+     fracaso      0.962     0.930     0.945      9997
+       éxito      0.096     0.168     0.122       447
+
+    accuracy                          0.897     10444
+   macro avg      0.529     0.549     0.534     10444
+weighted avg      0.924     0.897     0.910     10444
+
+  Top 10 features:
+    max_wallet_score               ██████████████████████ 0.4476
+    pct_high_score_wallets         ██████ 0.1356
+    avg_cooccurrence_score         █████ 0.1175
+    avg_wallet_score               █████ 0.1049
+    pct_negative_wallets           ██ 0.0423
+    n_early_buyers                 █ 0.0242
+    buys_20s_to_60s                █ 0.0208
+    pct_new_wallets                 0.0169
+    concentration_top5              0.0163
+    std_buy_size_sol                0.0153
+
+  ── Regresor ──
+  Train: 35,000 | Test: 8,952
+  RMSE: 1.3035
+  MAE:  1.0754
+  Target mean: 1.41x | Pred mean: 2.20x
+
+[4/4] Guardando...
+  models/classifier.json
+  models/regressor.json
+  models/metadata.json
+  10,444 señales guardadas.
+  Distribución:
+    high             12
+    low             900
+    medium          767
+    sin_señal     8,765
+
+============================================================
+COMPLETADO
+============================================================
