@@ -1,0 +1,729 @@
+# PROYECTO: PUMP.FUN INTELLIGENCE SYSTEM — CONTEXTO COMPLETO PARA CONTINUACIÓN
+
+## DESCRIPCIÓN GENERAL
+
+Sistema de ML para predecir qué coins lanzadas en pump.fun harán 2.5x sostenido en 4 horas, basado en el análisis de early buyers (primeros 3 minutos) y scoring histórico de wallets. El output principal es un score 0-1 por coin representando probabilidad de éxito, más un múltiplo esperado como output secundario.
+
+---
+
+## ARQUITECTURA DE DATOS
+
+### Fuentes de datos
+- **Dune Analytics**: extracción histórica de coins, early trades y precios. Plan gratuito con múltiples API keys rotando.
+- **Helius**: reservado para tiempo real (producción futura). No se usa actualmente para el histórico.
+
+### Estructura de directorios
+```
+BLOCKCHAIN MINING/
+├── data/raw/coins/         → coins_complete.csv + coins_YYYYMMDD.csv por semana
+├── data/raw/early_trades/  → trades_YYYYMMDD.csv por día + trades_complete.csv
+├── data/raw/prices/        → prices_YYYYMMDD.csv por día + prices_complete.csv
+├── models/                 → classifier.json, regressor.json, metadata.json
+├── src/
+│   ├── splitter.py
+│   ├── wallet_scoring.py
+│   ├── features.py
+│   └── model.py
+├── create_tables.sql
+├── loader.py               → en raíz según conversación, o src/loader.py
+├── dune_extract_coins.py
+├── dune_extract_historical.py
+├── .env
+└── requirements.txt
+```
+
+### Base de datos: PostgreSQL local, BD "pumpfun"
+
+**Tabla coins**: coin_address (PK), created_at (TIMESTAMPTZ), creator_wallet, price_at_5min, price_max_4h, price_max_sustained, max_sustained_start, label, rug_detected, prices_loaded, label_calculated, created_in_db_at.
+
+**Tabla early_buyers**: id (BIGSERIAL PK), coin_address (FK→coins), wallet_address, first_entry_seconds (NUMERIC), total_sol_spent (NUMERIC), total_usd_spent (NUMERIC), n_trades (INTEGER), tier (SMALLINT). UNIQUE(coin_address, wallet_address). Índices en coin_address, wallet_address, tier, first_entry_seconds.
+
+**Tabla coin_prices**: coin_address (PK FK→coins), price_at_5min, price_max_4h, price_min_5min, price_max_5min, max_multiple, label (SMALLINT), label_raw (SMALLINT), rug_detected (BOOLEAN), sustained_10min (SMALLINT), loaded_at.
+
+**Tabla wallet_metrics**: wallet_address (PK), appearances_total (INTEGER), win_rate (NUMERIC), avg_roi (NUMERIC), negative_rate (NUMERIC), performance_score (NUMERIC), score_reliable (BOOLEAN), last_calculated_at (TIMESTAMPTZ), first_seen_at (TIMESTAMPTZ).
+
+**Tabla coin_features**: coin_address (PK FK→coins), calculated_at, n_early_buyers, n_reliable_wallets, avg_wallet_score, max_wallet_score, pct_high_score_wallets, pct_negative_wallets, pct_new_wallets, avg_cooccurrence_score, total_volume_sol, avg_buy_size_sol, std_buy_size_sol, concentration_top5, n_tier1_buyers, creator_is_buyer (BOOLEAN), buys_in_first_20s, buys_20s_to_60s, buys_60s_to_180s, acceleration_ratio, time_to_5th_buy, hour_utc (SMALLINT), day_of_week (SMALLINT).
+
+**Tabla signals**: id (BIGSERIAL PK), coin_address (FK→coins), generated_at, model_score (NUMERIC), expected_multiple (NUMERIC), signal_tier (TEXT: 'high'/'medium'/'low'), outcome_label (SMALLINT), outcome_verified_at.
+
+---
+
+## DEFINICIONES EXACTAS
+
+### Early buyer
+Wallet que realiza una compra en los primeros **180 segundos** desde la creación de la coin.
+- Tier 1: first_entry_seconds ≤ 20
+- Tier 2: first_entry_seconds > 20 y ≤ 180
+
+### Creación de la coin
+MIN(block_time) de todas las transacciones de compra de esa coin en dex_solana.trades con project='pumpdotfun' y token_sold_mint_address='So11111111111111111111111111111111111111112'. Es el primer comprador, no el deployer del contrato (limitación técnica con Dune).
+
+### Label de éxito (label = 1)
+Condición dual:
+1. price_max_4h / price_at_5min ≥ 2.5
+2. sustained_10min = 1 (existe al menos un bucket de 10 minutos entre t=5min y t=4h donde el precio mínimo observado ≥ 1.5 × price_at_5min)
+
+label = 0 si no se cumple. label = NULL si price_at_5min es NULL o 0 (sin datos suficientes → excluida del entrenamiento).
+
+### price_at_5min
+Mediana (APPROX_PERCENTILE 0.5) de price_usd entre segundos 240 y 360 desde el lanzamiento. price_usd = amount_usd / token_bought_amount por transacción.
+
+### Rug detection
+rug_detected = TRUE si price_min_5min / price_max_5min < 0.2 (caída >80% en primeros 5 minutos).
+
+### label_raw
+Versión sin condición de sostenibilidad: 1 si price_max_4h / price_at_5min ≥ 2.5. Incluido para análisis comparativo, no usado en entrenamiento.
+
+---
+
+## PIPELINE DE DATOS DUNE
+
+### Query 1: pumpfun_coins_by_week (ID: 6917014)
+Parámetros: block_month, start_date, end_date. Paginación semanal. Extrae coin_address, created_at, creator_wallet.
+
+### Query 2: pumpfun_early_trades_by_day (ID: 6917262)
+Parámetros: block_month, start_date, end_date, end_date_extended (end_date + 2 días). Paginación diaria. Output **agregado por (coin_address, wallet_address)**: first_entry_seconds, total_sol_spent, total_usd_spent, n_trades, tier. Sin ORDER BY final (optimización de créditos). Sin tx_id ni block_time individuales. Reducción estimada 75-80% de volumen vs filas individuales. Coste estimado ~160-200 créditos/día (vs ~780 sin agregación).
+
+Optimización clave: un único scan de dex_solana.trades usando MIN(block_time) OVER (PARTITION BY token_bought_mint_address) en lugar de dos CTEs separadas.
+
+### Query 3: pumpfun_prices_by_day (ID: 6917275)
+Parámetros: block_month, start_date, end_date, end_date_extended (end_date + 2 días para cubrir ventana 4h). Lógica de buckets de 10 minutos para sostenibilidad. Output: coin_address, price_at_5min, price_max_4h, price_min_5min, price_max_5min, label, label_raw, max_multiple, rug_detected, sustained_10min. Solo incluye coins con actividad entre minuto 4 y 6 (INNER JOIN en base_stats con price_at_5min_calc). Aproximadamente 2.000 coins/día de las ~23.000 lanzadas (el 91% muere antes del minuto 4, decisión aceptada: estas coins no son útiles para el modelo).
+
+### Gestión de créditos Dune
+- 2.500 créditos gratuitos/mes por cuenta
+- 20 créditos/MB exportado
+- Estrategia: rotación de múltiples cuentas de amigos
+- Keys en .env como DUNE_API_KEY_1, DUNE_API_KEY_2, etc.
+- Error 402 = sin créditos → rotar key
+- Error 429 = rate limit → esperar 60s, reintentar misma key (no rotar)
+- Scripts reanudables: saltan archivos ya descargados
+
+### Rango temporal de datos
+Diciembre 23, 2025 → Marzo 25, 2026 (92 días). Las fechas son del futuro desde la perspectiva del modelo de entrenamiento de la IA porque los datos de pump.fun son actuales del proyecto real del usuario.
+
+---
+
+## ESTADO ACTUAL DE DATOS (última ejecución documentada)
+
+```
+coins:          2,525,392 filas (3 meses completos)
+early_buyers:   ~8,000,000+ filas (varios días, en expansión)
+coin_prices:    ~52,218 filas con label
+wallet_metrics: ~320,744 wallets
+coin_features:  ~52,218 coins
+signals:        ~10,444 (último test set)
+
+Labels en coin_prices (último estado conocido):
+  label=1 (éxito):    ~2,540 (~4.9%)
+  label=0 (fracaso):  ~49,678 (~95.1%)
+  rugs detectados:    ~22,000+ (~42%)
+```
+
+Split temporal: train 80% más antiguo, test 20% más reciente. Con 52,218 coins: train ~41,774, test ~10,444.
+
+---
+
+## MÓDULO SPLITTER (src/splitter.py)
+
+Función `get_train_test_coins(engine)` → (train_coins: set, test_coins: set).
+
+Lógica: consulta coin_prices JOIN coins WHERE label IS NOT NULL, ordena por created_at ASC, split en índice int(len × 0.8). Devuelve sets de coin_address. TRAIN_RATIO = 0.80.
+
+**Este módulo es compartido por wallet_scoring.py, features.py y model.py para garantizar el mismo split sin hardcodear fechas.**
+
+---
+
+## MÓDULO WALLET SCORING (src/wallet_scoring.py)
+
+### Parámetros actuales
+```python
+ROI_CAP         = 10.0   # cap por coin antes de calcular media
+MIN_APPEARANCES = 5      # mínimo para score_reliable = TRUE
+PRIOR_STRENGTH  = 5      # pseudo-observaciones Bayesian
+MAX_LIFT        = 8.0    # lift en que win_component satura (≈40% win rate con baseline 5%)
+PENALIZATION    = 0.20   # peso penalización por rugs
+```
+
+### Lógica de cálculo
+**Solo usa datos de train_coins** para evitar data leakage.
+
+Carga: early_buyers JOIN coin_prices JOIN coins WHERE label IS NOT NULL AND coin_address IN train_coins.
+
+Métricas por wallet:
+- appearances_total: count de coins
+- wins: sum(label)
+- win_rate: wins / appearances_total
+- avg_roi_capped: mean(min(max_multiple, ROI_CAP)), fillna=1.0
+- negative_rate: mean(rug_detected)
+- avg_entry_seconds: mean(first_entry_seconds), fillna=90.0
+- pct_tier1_entries: mean(tier == 1)
+- conviction_ratio: avg_sol en winners / avg_sol en losers, clip(0, 10). Si sin losers → 1.0. Si sin winners → 0.5.
+
+**Bayesian win rate**: bayesian_wr = (wins + PRIOR × global_wr) / (appearances_total + PRIOR)
+**Lift**: bayesian_wr / global_wr
+
+### Fórmula del score
+```python
+win_component        = clip(lift / MAX_LIFT, 0, 1)          # peso 0.65
+roi_component        = clip(avg_roi_capped / 5.0, 0, 1)     # peso 0.20
+entry_component      = clip(1 - avg_entry_seconds/180, 0,1) # peso 0.05
+conviction_component = clip((conviction_ratio-1)/3, 0, 1)   # peso 0.10
+penalization         = negative_rate × PENALIZATION
+
+performance_score = clip(
+    win_component*0.65 + roi_component*0.20 +
+    entry_component*0.05 + conviction_component*0.10 - penalization,
+    0, 1
+)
+```
+
+score_reliable = TRUE si appearances_total ≥ 5. Wallets sin score_reliable reciben performance_score calculado igual (no se fuerza 0.1 — el Bayesian shrinkage estabiliza automáticamente).
+
+### Estado actual (última ejecución)
+- 320,744 wallets totales
+- 67,504 wallets fiables (appearances ≥ 5)
+- 184 wallets fiables con score ≥ 0.5
+- Win rate global (train): ~6.35%
+- Rug rate global (train): ~42.34%
+- Score medio wallets fiables: ~0.105
+- avg_entry_seconds medio wallets fiables: 70.1s
+- conviction ratio medio: 0.80x
+
+**Nota diagnosticada**: la mayoría de wallets obtienen score bajo (~0.1) porque con baseline 5-6%, incluso wallets con 10% win rate tienen lift bajo y conviction bajo. Esto es esperado con el dataset actual. Mejorar con más datos.
+
+---
+
+## MÓDULO FEATURES (src/features.py)
+
+### Anti-leakage en co-ocurrencia
+Paso 1: Construir pair_counts SOLO con coins exitosas de train_coins.
+Paso 2: Aplicar lookup de pair_counts a TODAS las coins (train + test) → no hay leakage porque los pares se calculan solo desde train.
+
+MAX_WALLETS = 25 por coin (top por total_sol_spent) para limitar RAM en self-join.
+BATCH_SIZE = 3,000 coins por lote.
+
+### Features calculadas
+
+**Bloque 1 — Composición de wallets** (groupby coin_address sobre eb con wallet_metrics ya mergeado via SQL):
+- n_early_buyers: nunique(wallet_address)
+- n_reliable_wallets: sum(score_reliable)
+- avg_wallet_score: mean(performance_score)
+- max_wallet_score: max(performance_score)
+- pct_high_score_wallets: mean(performance_score > 0.6)
+- pct_negative_wallets: mean(negative_rate > 0.4)
+- pct_new_wallets: mean(appearances_total < 3)
+
+**Bloque 2 — Co-ocurrencia**:
+- avg_cooccurrence_score: media de cooc_count entre todos los pares de wallets de la coin, donde cooc_count = número de coins exitosas de train en que ese par coincidió.
+
+**Bloque 3 — Comportamiento de compra**:
+- total_volume_sol: sum(total_sol_spent)
+- avg_buy_size_sol: mean(total_sol_spent)
+- std_buy_size_sol: std(total_sol_spent), fillna=0
+- concentration_top5: suma SOL top 5 wallets / total_volume_sol
+- n_tier1_buyers: sum(tier == 1)
+- creator_is_buyer (Opción B implementada): TRUE si la wallet con wallet_address == creator_wallet realizó n_trades > 1 en los primeros 3 minutos. **Nota**: creator_wallet en coins es el primer comprador (limitación Dune), no el deployer del contrato. Con Opción A (forzar FALSE) se descartó porque el 100% salía TRUE. Con Opción B actual: ~5,340 coins con creator_is_buyer=TRUE de 52,218.
+
+**Bloque 4 — Velocidad de acumulación**:
+- buys_in_first_20s: sum(first_entry_seconds ≤ 20)
+- buys_20s_to_60s: sum(20 < first_entry_seconds ≤ 60)
+- buys_60s_to_180s: sum(60 < first_entry_seconds ≤ 180)
+- acceleration_ratio: buys_first_90s / max(buys_last_90s, 1)
+- time_to_5th_buy: 5th percentile of first_entry_seconds (NaN si < 5 compradores)
+
+**Bloque 5 — Contexto temporal** (desde coins.created_at):
+- hour_utc: hora UTC (0-23)
+- day_of_week: 0=lunes, 6=domingo
+
+---
+
+## MÓDULO MODEL (src/model.py)
+
+### Clasificador (XGBoost binary:logistic)
+- n_estimators=300, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8
+- scale_pos_weight automático: n_neg / n_pos
+- eval_metric='aucpr', early_stopping_rounds=20
+- THRESHOLD = 0.5 para clasificación en reporte
+
+**Signal tiers** (basados en model_score):
+- 'high': score ≥ 0.70
+- 'medium': score ≥ 0.50
+- 'low': score ≥ 0.35
+- None: score < 0.35
+
+### Regresor (XGBoost reg:squarederror)
+- Mismos hiperparámetros base
+- Target: max_multiple clipped upper=50
+- Solo sobre filas con max_multiple NOT NULL
+- Predice expected_multiple
+
+### Features usadas (21 columnas, orden fijo en FEATURE_COLS):
+```python
+FEATURE_COLS = [
+    "n_early_buyers", "n_reliable_wallets",
+    "avg_wallet_score", "max_wallet_score",
+    "pct_high_score_wallets", "pct_negative_wallets", "pct_new_wallets",
+    "avg_cooccurrence_score",
+    "total_volume_sol", "avg_buy_size_sol", "std_buy_size_sol",
+    "concentration_top5", "n_tier1_buyers", "creator_is_buyer",
+    "buys_in_first_20s", "buys_20s_to_60s", "buys_60s_to_180s",
+    "acceleration_ratio", "time_to_5th_buy",
+    "hour_utc", "day_of_week",
+]
+```
+
+creator_is_buyer se convierte a int (astype(int)) antes de pasar al modelo. Fillna(-1) para todo.
+
+### Resultados más recientes (con ~22 días de datos, ~52k coins)
+```
+AUC-ROC:  0.6670
+AUC-PR:   0.0795  (métrica principal)
+Fracaso:  precision=0.962, recall=0.930
+Éxito:    precision=0.096, recall=0.168
+Accuracy: 0.897
+
+Top features por importancia:
+  max_wallet_score:          44.76%
+  pct_high_score_wallets:    13.56%
+  avg_cooccurrence_score:    11.75%
+  avg_wallet_score:          10.49%
+  pct_negative_wallets:       4.23%
+  n_early_buyers:             2.42%
+  buys_20s_to_60s:            2.08%
+  ...
+
+Distribución señales test set (10,444 coins):
+  high:        12
+  medium:      767
+  low:         900
+  sin_señal:   8,765
+
+Regresor:
+  RMSE: 1.3035
+  MAE:  1.0754
+  Target mean: 1.41x | Pred mean: 2.20x (sobreestima)
+```
+
+### Modelos guardados
+- models/classifier.json
+- models/regressor.json
+- models/metadata.json (contiene FEATURE_COLS, train_ratio=0.80, trained_at)
+
+---
+
+## DECISIONES TÉCNICAS CLAVE Y SU RAZONAMIENTO
+
+### Decaimiento exponencial en wallet scoring: DESCARTADO
+Se discutió pero se descartó en la versión actual. El scoring usa historial completo sin decaimiento. Motivo: insuficientes datos para que las ventanas temporales sean significativas. Previsto para implementación futura cuando haya 60-90 días de datos.
+
+### Concentración top3 → top5: IMPLEMENTADO
+Cambio menor decidido por el usuario. Se usa concentration_top5.
+
+### Ventana early buyers: 180 segundos (3 minutos)
+Decisión fija. Tier 1 = primeros 20s, Tier 2 = 20-180s. No hay Tier 0 separado en la implementación actual (originalmente se discutió pero se integró en Tier 1/2).
+
+### creator_is_buyer: Opción B activa
+Opción A (forzar FALSE) implementada inicialmente porque 100% salía TRUE. Luego se implementó Opción B: TRUE si el primer comprador (creator_wallet) hizo n_trades > 1 en primeros 3 minutos. Limitación conocida: creator_wallet en Dune es el primer comprador, no el deployer real del contrato.
+
+### Split temporal 80/20 compartido
+Todos los módulos usan splitter.get_train_test_coins(). No hay fechas hardcodeadas. Se adapta automáticamente al volumen de datos disponible.
+
+### Query de prices: INNER JOIN (no LEFT JOIN) deliberado
+Se detectó que LEFT JOIN devolvía ~23k coins/día pero la mayoría sin label útil. Con INNER JOIN sobre coins con actividad entre minuto 4-6, se obtienen ~2k coins/día con label calculable. **Decisión aceptada**: el 91% de coins sin precio a 5min no son útiles para el modelo y no se incluyen.
+
+### Dune como única fuente histórica (no BigQuery, no Bitquery)
+BigQuery: dataset público de Solana desactualizado, queries con errores estructurales, coste prohibitivo en free tier. Bitquery: ofrecieron precio elevado al contactarles. Helius: reservado para tiempo real.
+
+### No usar ORDER BY en query de trades
+Eliminado para reducir coste en créditos Dune. Pandas reordena localmente si es necesario.
+
+### Datos en CSVs individuales por día/semana
+Scripts reanudables: si existe el archivo, se salta. Permite interrupción y reanudación sin reprocesar.
+
+### Filtro de sostenibilidad (buckets 10 min)
+Implementado en SQL directamente en Dune (Query 3). Alternativa de calcular en Python descartada porque requería serie temporal completa no disponible en el output actual.
+
+---
+
+## PROBLEMAS IDENTIFICADOS Y ESTADO
+
+### Data leakage: RESUELTO
+Versión anterior de features.py calculaba co-ocurrencia con todas las coins incluyendo test. AUC-ROC bajó de 0.974 → 0.667 tras la corrección, confirmando que el leakage estaba inflando métricas artificialmente. wallet_scoring.py también corregido para usar solo train_coins.
+
+### Wallet scores casi todos en 0.1: PARCIALMENTE RESUELTO
+Causa: con baseline ~5-6%, el lift de wallets mediocres es bajo. Solución implementada: Bayesian shrinkage + lift relativo + conviction ratio + entry speed. Problema residual: insuficientes datos para que la distribución de scores sea discriminativa. Con más días mejorará.
+
+### Regresor sobreestima (pred_mean 2.20x vs target_mean 1.41x): CONOCIDO
+No resuelto. El regresor predice expected_multiple para coins con max_multiple NOT NULL, pero hay sesgo de selección porque solo las que llegaron a tener precio calculado están en el dataset. No es prioritario actualmente.
+
+### avg_cooccurrence_score domina si hay leakage: RESUELTO
+Tras corrección anti-leakage, bajó de 57% a 11.75% de importancia, que es razonable.
+
+### creator_is_buyer: 100% TRUE con Opción A: RESUELTO con Opción B
+Ver sección anterior. Limitación de Dune (creator_wallet = primer comprador).
+
+---
+
+## MEJORAS PLANIFICADAS (BACKLOG PRIORIZADO)
+
+### Inmediata: más datos
+Objetivo: pasar de 22 días a 60-90 días. Con más coins, más wallets tendrán appearances_total ≥ 5 y scores más fiables.
+
+### Wallet scoring: reliability boost por actividad (discutido, no implementado)
+Propuesta: `score = base_score × (0.85 + 0.15 × min(appearances_total/20, 1.0))`. Dos wallets con mismo win rate pero diferente actividad se diferenciarían. No implementado aún.
+
+### Features adicionales propuestas (del backlog):
+- volume_weighted_wallet_score (descrito en README.md)
+- top_3_wallet_score_mean
+- pct_pairs_high_cooccurrence
+- n_pairs_seen_in_past_winners
+- varianza de wallet scores
+- pct_wallets_score_below_0.05
+
+### Backtesting real con simulación de slippage
+Previsto pero no implementado. Fórmula EV discutida: EV = P(éxito) × (multiple - 1) - (1 - P(éxito)) × 1.
+
+### Sistema de alertas en tiempo real (Helius)
+Previsto para cuando el modelo esté validado. Pipeline: nueva coin detectada → early_buyers vía Helius → coin_features en tiempo real → model.predict → signal. No iniciado.
+
+### Dashboard Streamlit
+Previsto, no iniciado. Actualización cada 15 minutos.
+
+---
+
+## VARIABLES DE ENTORNO (.env)
+
+```
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=pumpfun
+DB_USER=postgres
+DB_PASSWORD=<contraseña local>
+
+DUNE_API_KEY=<key principal, usada por dune_extract_coins.py>
+DUNE_QUERY_ID=6917014
+
+DUNE_API_KEY_1=<key 1>
+DUNE_API_KEY_2=<key 2>
+... (n keys disponibles)
+DUNE_QUERY_ID_TRADES=6917262
+DUNE_QUERY_ID_PRICES=6917275
+
+HELIUS_API_KEY=<reservado para tiempo real>
+```
+
+---
+
+## DEPENDENCIAS (requirements.txt)
+
+```
+pandas==2.2.0
+numpy==1.26.0
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+python-dotenv==1.0.0
+jupyter==1.0.0
+scikit-learn==1.4.0
+xgboost==2.0.3
+streamlit==1.31.0
+plotly==5.18.0
+requests==2.31.0
+dune-client (instalado vía pip, no pinned)
+```
+
+Python 3.11 (3.14 descartado por incompatibilidades con psycopg2-binary y scikit-learn). Entorno virtual: venv/ en raíz del proyecto.
+
+---
+
+## FLUJO DE EJECUCIÓN COMPLETO (orden correcto)
+
+```bash
+# 1. Extracción de coins (semanal, una vez)
+python dune_extract_coins.py
+
+# 2. Extracción de trades y precios (diaria, acumulativa)
+python dune_extract_historical.py
+
+# 3. Carga en PostgreSQL
+python src/loader.py
+
+# 4-6. Pipeline ML (ejecutar en orden tras cada nueva carga)
+python src/wallet_scoring.py
+python src/features.py
+python src/model.py
+```
+
+Los pasos 4-6 son idempotentes (ON CONFLICT DO UPDATE). Se pueden reejecutar cuando hay más datos sin perder nada.
+
+---
+
+## CONTEXTO ADICIONAL RELEVANTE
+
+### Escala de pump.fun
+~23,000 coins lanzadas por día. Solo ~9% tienen suficiente actividad para tener price_at_5min calculable. De esas, ~5% son label=1.
+
+### Desbalanceo de clases
+~95% label=0, ~5% label=1. Manejado con scale_pos_weight automático en XGBoost. Métrica principal: AUC-PR (no AUC-ROC) por ser más informativa con desbalanceo severo.
+
+### Ventana de precio para label
+- Referencia: mediana de precios entre minutos 4-6 (seconds 240-360)
+- Máximo: entre minuto 5 y hora 4 (seconds 300-14400)
+- Rug: comparación min/max en primeros 5 minutos
+- Buckets sostenibilidad: ventanas de 600s entre seconds 300-14400
+
+### Limitación del regresor
+Entrena solo sobre coins con max_multiple NOT NULL (las que tienen precio calculado, no solo label=1). Target clippeado a 50x para evitar outliers extremos.
+
+### Tamaño actual del modelo
+classifier: 31 árboles (early stopping a las 11 iteraciones sobre 300 estimadores). regressor: 26 árboles.
+
+### Estado del README.md
+Contiene un backlog informal con ideas de mejoras futuras (features de smart money, co-ocurrencia avanzada, embeddings de wallets, graph features). Sirve como referencia de roadmap pero nada implementado de lo listado ahí salvo lo ya descrito en este documento.
+
+---
+
+## PUNTO DE CONTINUACIÓN ACTUAL
+
+El sistema está operativo end-to-end. El usuario está en proceso de acumular más días de datos (objetivo: 60-90 días). La siguiente iteración prioritaria es:
+
+1. Continuar descargando datos con dune_extract_historical.py usando nuevas API keys
+2. Reejecutar wallet_scoring.py → features.py → model.py cuando haya suficientes datos
+3. Evaluar si el AUC-PR mejora significativamente con más datos
+4. Considerar implementar el reliability boost en wallet scoring
+5. Cuando el modelo sea suficientemente robusto, desarrollar el sistema de alertas en tiempo real con Helius
+
+La discusión más reciente antes de esta transición de contexto fue sobre optimizar la query pumpfun_early_trades_by_day para reducir consumo de créditos Dune, cuya versión optimizada ya está implementada en Dune (Query ID 6917262). El usuario también preguntó sobre posibles mejoras adicionales al sistema de wallet scoring, específicamente si se debería dar más peso a wallets con mayor número de apariciones manteniendo el mismo win rate.
+
+FORMATO DE LOS CSV GENERADOS CON dune_extract_coins.py y dune_extract_historical.py:
+
+coins:
+coin_address,created_at,creator_wallet
+98zdL2m5etXK5c6KdBWFJfupB9scR2gEBcVZhHcVpump,2025-12-23 00:00:00.000 UTC,4RawRw89TBqc1PQny8wP6FaX3Qh7AJQjfWQo1DCg7skn
+DN3ipA8MTLb4u7MsGW5m3uTCMV2nkVyouVX3QbSppump,2025-12-23 00:00:00.000 UTC,5MzY4tf8G9RYDtKK1bSyqmArmuVRsrbAeieh48DUdE9A
+yLjrSny8Uc8LB4ioMmC7KcyXRt64Jw864iYHqdupump,2025-12-23 00:00:00.000 UTC,zmqmskagNc5VThKMe3TqNQxguKD5dbP5d9Nm6nVVszk
+213Z9KVCrSprGzzJgohQRX6us8hvoMq1B13vXUY6pump,2025-12-23 00:00:00.000 UTC,DrjE3TJEcfLUChrbvyKeR64sac8eo2Q2TbE1hXUw9Zmd
+AA8ijkr2fnKtbSez2rw8fCG3RvPgmtKvoEVGUbgRpump,2025-12-23 00:00:00.000 UTC,DU8Lex79Fc5qae2gbRp6ZFzrGPcvsfbF2rUmTd5kcVp2
+DHJag7PEf9xZrp2wPuQbQnb9sHa565Dgp5d3V4q49GH,2025-12-23 00:00:00.000 UTC,AhiPCvUFPdUSv58vYqhwk2dKJKg9PftKEGmSNvJ9qeji
+GsrKkWZwkDc4LAqj9jf8iz2NbiNYX6JPuhBfGQ4Lpump,2025-12-23 00:00:01.000 UTC,GhgtWi1GjoxxhRM8hZs8LjTj1s74RCzd4gQZfk1hLUsk
+GJbKWmiWnT2Be44LBzdFw1Zp6SoVQk2JAAy6etbSpump,2025-12-23 00:00:01.000 UTC,3LFb31Gz8dm1HBu9DwN1RyDLyrjfHyaNBPT3MJpPBiTD
+5GtSNJEDFcGmQFvcxpfSJyM4AdCwiuBk5vgHkrH5pump,2025-12-23 00:00:01.000 UTC,DvUm38jcYDWxH1cF9eozqBfJxpGDZ2AgbKpgZjuoqT1C
+GdFE6VsVAD3PNkDs1PCDZibVq1NuvCUYfAUBEMLhpump,2025-12-23 00:00:01.000 UTC,78hYn9WEiX3bdWR15g6QN79B6ha2bk2FNjM8twZXK159
+ALfKcVYeRhyubVwvDJozzJpUZ1shpFoiDQgtFDVCpump,2025-12-23 00:00:01.000 UTC,F7wxEcosp7GYHooVzGhXnJ88sNfQ37muDNUCincKbocV
+
+trades:
+coin_address,wallet_address,first_entry_seconds,total_sol_spent,total_usd_spent,n_trades,tier
+26QPiKR8s9LEssYjXGZMzBZGoF2qDoCpd3j7LcQvpump,12BRrNxzJYMx7cRhuBdhA71AchuxWRcvGydNnDoZpump,0,1.005573291,124.51008489161998,1,1
+26QPiKR8s9LEssYjXGZMzBZGoF2qDoCpd3j7LcQvpump,CiJhwW1xiBAGeGCcNWKSkdiXYkZgpPrAhXsfWse38isg,0,0.680046271,84.20332927522,1,1
+26QPiKR8s9LEssYjXGZMzBZGoF2qDoCpd3j7LcQvpump,3145cS1Syvt7PfnwH5zHDg61Li5HmE9JkmeeafdsumHN,0,2.962962961,366.87407383102,1,1
+2UnQx3gw1RWi52KUmTDMV4ZVgSP4qyWgJSPV2yqvpump,3BPSCHbao3ZTj4QSg9jsVNLw1SmqKrWKiJWwZkuYFyTu,0,0.078933124,9.80191533832,1,1
+2UnQx3gw1RWi52KUmTDMV4ZVgSP4qyWgJSPV2yqvpump,BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s,3,0.125259898,15.53753438884,12,1
+2UnQx3gw1RWi52KUmTDMV4ZVgSP4qyWgJSPV2yqvpump,CZCSjC4mVVKmGonHK18Z7BEk2vGQxWYiKWZKk5j54bkg,37,0.09875,12.23315,1,2
+2XRKNzQfTfMykF54kurWaNxnY1ixpJcnW74F317Fpump,87TuMKrBxWN6VmhaovFUXmtQNQ1jg4pNHXjJzxs7X2E7,0,1.2,149.7,1,1
+2XRKNzQfTfMykF54kurWaNxnY1ixpJcnW74F317Fpump,25PuSE1RVeeau3XhVLY4Wrhu1D5osFf5DZkYqVqKHmDf,4,1.12410579,140.2321973025,1,1
+2XRKNzQfTfMykF54kurWaNxnY1ixpJcnW74F317Fpump,CS6xZBZQ7HfhUNAYeqENdruT2addseDy81PDntyYa1NE,0,1.13964391,142.1705777725,1,1
+
+prices:
+coin_address,price_at_5min,price_max_4h,price_min_5min,price_max_5min,label,label_raw,max_multiple,rug_detected,sustained_10min
+Bk72QFCGfNZDqEWkDVW7q8DNaNrmk61h4wjSc3Tipump,1.819876264810136e-05,3.754810914590753e-05,3.529951790698559e-06,2.5829482976062037e-05,0,0,2.06,True,0
+EXAmqhQ51UzukZsAL3neLeWanW5Dwc8VGW9Hstsdpump,5.365916305047067e-06,7.298779202872314e-06,3.513503653437744e-06,6.303260012330369e-06,0,0,1.36,False,0
+9anYhZxxHmJw8XLgZFZcFzoQjcPkBQMb7Aa1ApNvpump,2.02613082186064e-06,2.02613082186064e-06,4.2662830970699845e-07,3.5543345706776093e-06,0,0,1,True,0
+5HxausMppmXMkQXkTkiv7hvPVKQPueorVGY599Htpump,7.133802581879885e-06,7.134113883914083e-06,6.91396418460544e-06,7.133802581879885e-06,0,0,1,False,0
+DNF8Bm5Svit7U8yXpMovqmAtPvvQ7HmJWFzy4ZQUpump,3.576479099746216e-06,3.576479099746216e-06,3.623175819371052e-06,3.885341562997685e-05,0,0,1,True,0
+A3viaMZUURbJD7hh2aox954DadMFxqSXeaaZrkKcpump,6.447543541473049e-06,1.0799696009225981e-05,3.5266809400217327e-06,1.2137582150378702e-05,0,0,1.68,False,0
+Hgnr2QR6GGVDzPUf4gvdo2i9sVLVAJchuM9D7cB7pump,1.1734181054611368e-05,1.767377506647499e-05,3.825077081732801e-06,1.6494971866489858e-05,0,0,1.51,False,0
+AC9NkWTUVix1LrUQ5pSxBAgr4ygRqNahYLdgA8Tfpump,1.6407050418765257e-05,0.0003171308120215129,3.686249467630966e-06,1.6904204867334112e-05,0,1,19.33,False,0
+AoP87i9zAnAy4gZubZiqcuieAyw5xGmpgRNYqWZnnyV2,1.2389604858154471e-05,1.553868029988742e-05,3.5148300093224224e-06,1.7621051098871692e-05,0,0,1.25,True,0
+
+
+otra informacion que puede ser interesante:
+
+log despues de haber entrenado el modelo:
+
+(venv) PS C:\Users\guill\Desktop\BLOCKCHAIN_MINING> python .\src\wallet_scoring.py
+============================================================
+WALLET SCORING — lift + Bayesian + entry speed + conviction
+  ROI cap:          10.0x
+  Prior strength:   5 pseudo-observaciones
+  MAX_LIFT:         8.0x  (~40% win rate satura con baseline 5%)
+  Pesos:            win=50%, roi=20%, entry=15%, conviction=15%
+  Penalización:     negative_rate × 0.2
+  Min apariciones:  5  (flag score_reliable)
+============================================================
+
+[0/3] Determinando split temporal...
+  Train: 41,774 coins | Test: 10,444 coins
+
+[1/3] Cargando datos (solo train)...
+  Cargando datos de early_buyers + coin_prices (solo train)...
+  2,698,982 filas (de 3,347,140 totales) | solo 41,774 coins de train
+  320,744 wallets únicas en train
+
+[2/3] Calculando métricas...
+  Win rate global (train):   0.0635  (6.3%)
+  Rug rate global (train):   0.4234  (42.3%)
+  Aplicando cap de ROI por coin...
+  Calculando métricas por wallet (sobre datos de train)...
+  Calculando velocidad de entrada...
+  Calculando conviction ratio...
+  Calculando Bayesian win rate y lift...
+  Calculando scores...
+
+  Diagnóstico wallets fiables (67,504):
+    Win rate medio:             0.063
+    Lift medio:                 0.99x
+    Avg ROI capeado medio:      1.86x
+    Avg entry seconds medio:    70.1s
+    Pct tier1 entries medio:    23.0%
+    Conviction ratio medio:     0.80x
+    Negative rate medio:        0.448
+    Score medio:                0.105
+
+[3/3] Guardando en wallet_metrics...
+
+  Guardando 320,744 wallets en wallet_metrics...
+    320,744 wallets guardadas.
+
+============================================================
+RESUMEN FINAL
+
+  Total wallets:                 320,744
+  Wallets fiables (>=5):           67,504
+  Fiables con score >= 0.5:          184
+  Negative rate > 40%:           170,118
+
+  Distribución de scores:
+    0.0  ██████████████████████  (141,298)
+    0.1  █████████████  (88,935)
+    0.2  ██████████  (69,654)
+    0.3  █  (10,561)
+    0.4    (4,737)
+    0.5    (5,153)
+    0.6    (312)
+    0.7    (80)
+    0.8    (12)
+    0.9    (2)
+
+  Top 10 wallets fiables:
+  wallet               apps   win%     roi   neg%  score
+  -------------------------------------------------------
+  31yfwWmYgbF2axSfz8..   13   0.69    4.14x   0.00  0.880
+  2DDSNzStsMQYfhS1aD..   15   0.60    4.92x   0.00  0.854
+  DyHtfzEB6F1R4QmFYi..   14   0.64    4.34x   0.07  0.840
+  BQzj37kPRXBmkrx7A9..   21   0.62    3.87x   0.14  0.826
+  9w7C3PCGQ5gkKvYCgc..   13   0.62    4.37x   0.00  0.808
+  81dhoF1S5UQXFkZh6L..    8   0.75    4.46x   0.12  0.798
+  8krTDoEPzVV6YtnR3C..    7   0.71    3.71x   0.29  0.795
+  9omZBh9vR218vPzMqM..   16   0.56    4.12x   0.00  0.777
+  4pV6sLvCBCe8u3EK2M..   13   0.54    3.85x   0.00  0.747
+  GLvTmtRfGJBzoRErcY..   15   0.53    4.13x   0.00  0.743
+============================================================
+(venv) PS C:\Users\guill\Desktop\BLOCKCHAIN_MINING> python .\src\features.py
+============================================================
+FEATURES — coin_features (vectorizado, sin leakage)
+============================================================
+
+[1/4] Cargando datos...
+  Cargando early_buyers + wallet_metrics (join en SQL)...
+    8,002,782 filas early_buyers
+  Cargando coin_prices...
+    52,218 coins con label
+  Cargando coins (meta)...
+    2,525,392 coins
+
+[2/4] Determinando split y calculando co-ocurrencias...
+  Train: 41,774 | Test: 10,444
+  Calculando co-ocurrencias (solo sobre coins exitosas de train)...
+    Coins exitosas en train: 2,093
+    11,243,699 pares únicos con co-ocurrencia > 0
+    Co-ocurrencia calculada para 398,975 coins
+
+[3/4] Calculando features...
+  52,218 coins, 3,347,140 filas early_buyers
+  Bloque 1: composición de wallets...
+  Bloque 2: co-ocurrencia...
+  Bloque 3: comportamiento de compra...
+  Creator is buyer...
+  Bloque 4: velocidad de acumulación...
+  Bloque 5: contexto temporal...
+  Uniendo bloques...
+  Features calculadas para 52,218 coins
+
+[4/4] Guardando en coin_features...
+  Guardando 52,218 filas en coin_features...
+    52,218 filas guardadas.
+
+============================================================
+RESUMEN FINAL
+
+  coin_features generadas:   52,218
+  Avg early buyers:          64.1
+  Avg wallet score:          0.1318
+  Avg % wallets nuevas:      20.72%
+  Avg acceleration ratio:    6.27
+  Coins con creator buyer:   5,340
+  Avg co-ocurrencia:         1.8320
+============================================================
+(venv) PS C:\Users\guill\Desktop\BLOCKCHAIN_MINING> python .\src\model.py
+============================================================
+MODEL TRAINING (sin data leakage)
+============================================================
+
+[1/4] Cargando dataset...
+  Dataset: 52,218 filas, 2540 positivos (4.9% tasa de éxito)
+
+[2/4] Preparando datos (split temporal compartido)...
+  Train: 41,774 coins (2025-12-23 00:00:01+00:00 → 2026-01-11 17:36:16+00:00)
+  Test:  10,444 coins (2026-01-11 17:36:22+00:00 → 2026-01-14 23:59:47+00:00)
+  Positivos train: 2093 (5.0%)
+  Positivos test:  447 (4.3%)
+
+[3/4] Entrenando modelos...
+
+  ── Clasificador ──
+  scale_pos_weight: 19.0 (39681 neg / 2093 pos)
+
+  AUC-ROC: 0.6670
+  AUC-PR:  0.0795  ← métrica principal con desbalanceo
+
+  Reporte (umbral 0.5):
+              precision    recall  f1-score   support
+
+     fracaso      0.962     0.930     0.945      9997
+       éxito      0.096     0.168     0.122       447
+
+    accuracy                          0.897     10444
+   macro avg      0.529     0.549     0.534     10444
+weighted avg      0.924     0.897     0.910     10444
+
+  Top 10 features:
+    max_wallet_score               ██████████████████████ 0.4476
+    pct_high_score_wallets         ██████ 0.1356
+    avg_cooccurrence_score         █████ 0.1175
+    avg_wallet_score               █████ 0.1049
+    pct_negative_wallets           ██ 0.0423
+    n_early_buyers                 █ 0.0242
+    buys_20s_to_60s                █ 0.0208
+    pct_new_wallets                 0.0169
+    concentration_top5              0.0163
+    std_buy_size_sol                0.0153
+
+  ── Regresor ──
+  Train: 35,000 | Test: 8,952
+  RMSE: 1.3035
+  MAE:  1.0754
+  Target mean: 1.41x | Pred mean: 2.20x
+
+[4/4] Guardando...
+  models/classifier.json
+  models/regressor.json
+  models/metadata.json
+  10,444 señales guardadas.
+  Distribución:
+    high             12
+    low             900
+    medium          767
+    sin_señal     8,765
+
+============================================================
+COMPLETADO
+============================================================
