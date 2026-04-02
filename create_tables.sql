@@ -54,68 +54,70 @@ CREATE TABLE IF NOT EXISTS coin_prices (
 );
 
 -- ── Tabla wallet_metrics ──────────────────────────────────────
--- Score de cada wallet calculado sobre el histórico completo.
 CREATE TABLE IF NOT EXISTS wallet_metrics (
     wallet_address      TEXT PRIMARY KEY,
-    appearances_total   INTEGER DEFAULT 0,   -- apariciones totales en el dataset
-    win_rate            NUMERIC,             -- % coins exitosas (label=1) sobre total
-    avg_roi             NUMERIC,             -- ROI medio sobre coins con precio calculado
-    negative_rate       NUMERIC,             -- % coins con rug_detected=TRUE sobre total
-    performance_score   NUMERIC,             -- score final entre 0 y 1
-    score_reliable      BOOLEAN DEFAULT FALSE, -- TRUE si appearances_total >= 5
+    appearances_total   INTEGER DEFAULT 0,
+    win_rate            NUMERIC,
+    avg_roi             NUMERIC,
+    negative_rate       NUMERIC,
+    performance_score   NUMERIC,
+    score_reliable      BOOLEAN DEFAULT FALSE,
     last_calculated_at  TIMESTAMPTZ,
     first_seen_at       TIMESTAMPTZ
 );
 
 -- ── Tabla coin_features ───────────────────────────────────────
--- Features calculadas por coin para el modelo de ML.
 CREATE TABLE IF NOT EXISTS coin_features (
     coin_address             TEXT PRIMARY KEY REFERENCES coins(coin_address),
     calculated_at            TIMESTAMPTZ DEFAULT NOW(),
-
-    -- Composición de wallets
     n_early_buyers           INTEGER,
     n_reliable_wallets       INTEGER,
     avg_wallet_score         NUMERIC,
     max_wallet_score         NUMERIC,
-    pct_high_score_wallets   NUMERIC,   -- % wallets con score > 0.6
-    pct_negative_wallets     NUMERIC,   -- % wallets con negative_rate > 0.4
-    pct_new_wallets          NUMERIC,   -- % wallets sin historial (appearances_total < 3)
-
-    -- Co-ocurrencia
-    avg_cooccurrence_score   NUMERIC,   -- media de veces que pares de wallets han
-                                        -- coincidido en coins exitosas previas
-
-    -- Comportamiento de compra
+    pct_high_score_wallets   NUMERIC,
+    pct_negative_wallets     NUMERIC,
+    pct_new_wallets          NUMERIC,
+    avg_cooccurrence_score   NUMERIC,
     total_volume_sol         NUMERIC,
     avg_buy_size_sol         NUMERIC,
-    std_buy_size_sol         NUMERIC,   -- desviación estándar (baja = posible bot)
-    concentration_top5       NUMERIC,   -- % volumen en top 5 wallets por SOL gastado
-    n_tier1_buyers           INTEGER,   -- wallets que entraron en primeros 20s
-    creator_is_buyer         BOOLEAN,   -- TRUE si creator_wallet aparece en early_buyers
-
-    -- Velocidad de acumulación
+    std_buy_size_sol         NUMERIC,
+    concentration_top5       NUMERIC,
+    n_tier1_buyers           INTEGER,
+    creator_is_buyer         BOOLEAN,
     buys_in_first_20s        INTEGER,
     buys_20s_to_60s          INTEGER,
     buys_60s_to_180s         INTEGER,
-    acceleration_ratio       NUMERIC,   -- buys_first_90s / max(buys_last_90s, 1)
-    time_to_5th_buy          NUMERIC,   -- segundos hasta la quinta compra
-
-    -- Contexto temporal
-    hour_utc                 SMALLINT,  -- hora UTC del lanzamiento (0-23)
-    day_of_week              SMALLINT   -- día semana (0=lunes, 6=domingo)
+    acceleration_ratio       NUMERIC,
+    time_to_5th_buy          NUMERIC,
+    hour_utc                 SMALLINT,
+    day_of_week              SMALLINT
 );
 
 -- ── Tabla signals ─────────────────────────────────────────────
+-- model_score:       probabilidad calibrada (0-1)
+-- expected_multiple: múltiplo esperado (regresor XGBoost)
+-- ev_score:          Expected Value por unidad apostada
+--                    EV = P × 1.395 + (1-P) × (-0.55)
+--                    Break-even: P ≈ 28.3% de precisión
+-- signal_tier:       'high' (EV>0.30) / 'medium' (EV>0.10) /
+--                    'low' (EV>0.00) / NULL (no señal)
+-- outcome_label:     resultado real (se rellena tras la coin)
 CREATE TABLE IF NOT EXISTS signals (
     id                  BIGSERIAL PRIMARY KEY,
     coin_address        TEXT REFERENCES coins(coin_address),
     generated_at        TIMESTAMPTZ DEFAULT NOW(),
-    model_score         NUMERIC,          -- probabilidad de éxito (0-1)
-    expected_multiple   NUMERIC,          -- múltiplo esperado (modelo de regresión)
-    signal_tier         TEXT,             -- 'high', 'medium', 'low'
-    outcome_label       SMALLINT,         -- resultado real (se rellena después)
+    model_score         NUMERIC,
+    expected_multiple   NUMERIC,
+    ev_score            NUMERIC,
+    signal_tier         TEXT,
+    outcome_label       SMALLINT,
     outcome_verified_at TIMESTAMPTZ
 );
 
-SELECT 'Tablas creadas correctamente' AS status;
+-- ── Índices signals ───────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_signals_coin    ON signals(coin_address);
+CREATE INDEX IF NOT EXISTS idx_signals_tier    ON signals(signal_tier);
+CREATE INDEX IF NOT EXISTS idx_signals_ev      ON signals(ev_score);
+CREATE INDEX IF NOT EXISTS idx_signals_gen     ON signals(generated_at);
+
+SELECT 'Tablas y migración completadas correctamente' AS status;

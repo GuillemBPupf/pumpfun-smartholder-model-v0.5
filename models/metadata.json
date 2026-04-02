@@ -23,5 +23,31 @@
     "day_of_week"
   ],
   "train_ratio": 0.8,
-  "trained_at": "2026-04-01T10:04:20.162146+00:00"
+  "trained_at": "2026-04-02T09:11:12.313885+00:00",
+  "optimal_threshold": 0.131,
+  "precision_breakeven": 0.2828,
+  "slippage": 0.03,
+  "take_profit_x": 2.5,
+  "stop_loss_frac": 0.5,
+  "avg_loss_on_failure": -0.55,
+  "backtest_summary": {
+    "Baseline (todo)": {
+      "threshold": 0.01,
+      "n_signals": 10444,
+      "n_wins": 447,
+      "precision": 0.0428,
+      "avg_pnl": 0.036767,
+      "total_pnl": 383.9933,
+      "sharpe": 6.89
+    },
+    "\u00d3ptimo (0.13)": {
+      "threshold": 0.131,
+      "n_signals": 31,
+      "n_wins": 6,
+      "precision": 0.1935,
+      "avg_pnl": 0.627448,
+      "total_pnl": 19.4509,
+      "sharpe": 5.8803
+    }
+  }
 }
