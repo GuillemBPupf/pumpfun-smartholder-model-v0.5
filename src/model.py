@@ -56,14 +56,18 @@ os.makedirs("models", exist_ok=True)
 
 
 # ── Constantes de simulación ───────────────────────────────────
-SLIPPAGE        = 0.03   # slippage de entrada y salida (3%)
-TAKE_PROFIT_X   = 2.5    # múltiplo de take profit (coincide con label=1)
-STOP_LOSS_FRAC  = 0.50   # floor de salida para label=0 sin rug
-RUG_RECOVERY    = 0.15   # fracción recuperada si hay rug
+SLIPPAGE                = 0.03   # slippage de entrada y salida (3%)
+TAKE_PROFIT_X           = 2.5    # múltiplo de take profit (coincide con label=1)
+RUG_RECOVERY            = 0.15   # fracción recuperada si hay rug
+NOLABEL_EXIT_MULTIPLIER = 0.80   # salida fija para label=0 sin rug
+STOP_LOSS_FRAC          = 1 - NOLABEL_EXIT_MULTIPLIER # (stop loss ~20% por debajo de entrada) Más realista que asumir salida en el máximo histórico.
+TRADE_SIZE              = 50
 
-# Pérdida media estimada cuando la señal fracasa.
-# Empírico del histórico: 42% rugs (-88%) + 58% no-rugs (-30%) ≈ -55%
-AVG_LOSS_ON_FAILURE = -0.55
+# Pérdida media estimada cuando la señal fracasa (para fórmula EV):
+#   42% rugs     → pnl ≈ -0.88
+#   58% no-rugs  → pnl = NOLABEL_EXIT_MULTIPLIER × (1-slip) - (1+slip) ≈ -0.25
+#   Promedio: 0.42 × (-0.88) + 0.58 × (-0.25) ≈ -0.52
+AVG_LOSS_ON_FAILURE = -0.52
 
 # Mínimo de señales para evaluar un umbral en la búsqueda
 MIN_SIGNALS = 10
@@ -74,7 +78,7 @@ THRESHOLD_FALLBACK = 0.50
 # Break-even precision:
 #   EV=0  →  P × gain_éxito = (1-P) × |AVG_LOSS_ON_FAILURE|
 #   gain_éxito = 2.5×(1-slip) - (1+slip) = 1.395 con slip=3%
-#   P_be = 0.55 / (1.395 + 0.55) ≈ 28.3%
+#   P_be = 0.52 / (1.395 + 0.52) ≈ 27.1%
 _GAIN_SUCCESS       = TAKE_PROFIT_X * (1 - SLIPPAGE) - (1 + SLIPPAGE)
 PRECISION_BREAKEVEN = abs(AVG_LOSS_ON_FAILURE) / (_GAIN_SUCCESS + abs(AVG_LOSS_ON_FAILURE))
 
@@ -174,19 +178,22 @@ def prepare_data(df: pd.DataFrame, train_coins: set, test_coins: set):
 
 def simulate_trade_pnl(
     label: int,
-    max_multiple,
+    max_multiple,        # mantenido en firma por compatibilidad, no se usa para label=0
     rug_detected: bool,
     slippage: float = SLIPPAGE,
 ) -> float:
     """
     Estima el P&L neto por unidad apostada dado el outcome real.
 
-    Supuestos (condicionados por los datos disponibles):
-    - label=1        → exit al take profit (TAKE_PROFIT_X)
-    - label=0 + rug  → exit al RUG_RECOVERY del entry
-    - label=0 no-rug → exit al max(min(max_multiple, TP), STOP_LOSS_FRAC)
-      ⚠ Optimista: asume salida cerca del máximo histórico de la coin.
-        En producción real la salida ocurre antes o después del pico.
+    Escenarios:
+    - label=1              → exit al take profit (TAKE_PROFIT_X)
+    - label=0 + rug        → exit a RUG_RECOVERY del precio de entrada
+    - label=0 sin rug      → exit a NOLABEL_EXIT_MULTIPLIER del precio de entrada
+                              (stop loss fijo ~20% por debajo de entrada)
+
+    La versión anterior usaba max_multiple como precio de salida para
+    label=0 sin rug, lo que era OPTIMISTA (asumía vender en el máximo).
+    La versión actual usa un stop loss fijo más realista.
 
     Returns: P&L neto por unidad (>0 ganancia, <0 pérdida).
     """
@@ -194,20 +201,12 @@ def simulate_trade_pnl(
 
     if label == 1:
         exit_val = TAKE_PROFIT_X * (1.0 - slippage)
-
     elif bool(rug_detected):
         exit_val = RUG_RECOVERY * (1.0 - slippage)
-
     else:
-        mm = (
-            float(max_multiple)
-            if max_multiple is not None and not np.isnan(float(max_multiple))
-            else 1.0
-        )
-        effective = max(min(mm, TAKE_PROFIT_X), STOP_LOSS_FRAC)
-        exit_val  = effective * (1.0 - slippage)
+        exit_val = NOLABEL_EXIT_MULTIPLIER * (1.0 - slippage)
 
-    return round(exit_val - entry, 6)
+    return round((exit_val - entry) * TRADE_SIZE, 6)
 
 
 # ── EV por señal (para producción) ────────────────────────────
@@ -362,7 +361,7 @@ def find_optimal_threshold(
     print(f"    Precisión:        {best['precision']:.1%}  "
           f"(break-even: {PRECISION_BREAKEVEN:.1%})")
     print(f"    Avg P&L / señal:  {best['avg_pnl']:+.4f}")
-    print(f"    P&L total:        {best['total_pnl']:+.2f} unidades")
+    print(f"    P&L total:        {best['total_pnl']:+.2f} unidades (x{TRADE_SIZE})")
 
     # Tabla de umbrales clave
     key_t = {0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80}
@@ -613,6 +612,7 @@ def save_models(
         "take_profit_x":        TAKE_PROFIT_X,
         "stop_loss_frac":       STOP_LOSS_FRAC,
         "avg_loss_on_failure":  AVG_LOSS_ON_FAILURE,
+        "trade_size":           TRADE_SIZE,
         "backtest_summary":     backtest_results,
     }
     with open("models/metadata.json", "w") as f:

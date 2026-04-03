@@ -23,7 +23,18 @@ Métricas por estrategia:
 Output adicional:
   - Evolución del P&L acumulado (inicio → fin → pico → valle)
   - Desglose mensual de la estrategia óptima
-  - Notas sobre supuestos del backtesting
+  - Análisis real por tier (EV-based)
+
+── Modelo de P&L ──────────────────────────────────────────────
+  label=1              → salida al take profit (2.5x)
+  label=0 + rug        → recuperación del 15% del capital
+  label=0 sin rug      → salida fija a NOLABEL_EXIT_MULTIPLIER (0.80x)
+                          Representa un stop loss realista: no puedes
+                          vender en el máximo histórico.
+
+  La versión anterior asumía salida al máximo histórico para label=0
+  sin rug, lo que generaba P&L positivo incluso en monedas perdedoras
+  (OPTIMISTA e irreal para producción).
 
 Uso:
     python src/backtest.py
@@ -38,15 +49,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Constantes (deben coincidir con model.py) ──────────────────
-SLIPPAGE        = 0.03
-TAKE_PROFIT_X   = 2.5
-STOP_LOSS_FRAC  = 0.50
-RUG_RECOVERY    = 0.15
-AVG_LOSS_ON_FAILURE = -0.55
+# ── Constantes de simulación ───────────────────────────────────
+SLIPPAGE                = 0.03   # slippage entrada + salida
+TAKE_PROFIT_X           = 2.5    # múltiplo objetivo (coincide con label=1)
+RUG_RECOVERY            = 0.15   # fracción recuperada en rug
+NOLABEL_EXIT_MULTIPLIER = 0.80   # salida fija para label=0 sin rug # (stop loss ~20% por debajo de entrada)
+TRADE_SIZE              = 50
 
+# Pérdida media estimada cuando la señal fracasa (para fórmula EV):
+#   42% rugs     → pnl ≈ -0.88
+#   58% no-rugs  → pnl = NOLABEL_EXIT_MULTIPLIER × (1-slip) - (1+slip) ≈ -0.25
+#   Promedio: 0.42 × (-0.88) + 0.58 × (-0.25) ≈ -0.52
+AVG_LOSS_ON_FAILURE = -0.52
+
+# Break-even:  P_be = |loss| / (gain + |loss|)
+# gain = 2.5 × (1-0.03) - (1+0.03) = 1.395
 _GAIN_SUCCESS       = TAKE_PROFIT_X * (1 - SLIPPAGE) - (1 + SLIPPAGE)
-PRECISION_BREAKEVEN = abs(AVG_LOSS_ON_FAILURE) / (_GAIN_SUCCESS + abs(AVG_LOSS_ON_FAILURE))
+PRECISION_BREAKEVEN = abs(AVG_LOSS_ON_FAILURE) / (
+    _GAIN_SUCCESS + abs(AVG_LOSS_ON_FAILURE)
+)
 
 
 # ── Conexión ───────────────────────────────────────────────────
@@ -72,8 +93,9 @@ def load_metadata() -> dict:
 
 def load_signals(engine) -> pd.DataFrame:
     """
-    Carga las señales del test set (las que tienen outcome_label conocido)
-    junto con los datos de precio necesarios para la simulación.
+    Carga las señales del test set (con outcome_label conocido).
+    Aplica drop_duplicates sobre coin_address para evitar que filas
+    duplicadas en signals (sin UNIQUE constraint) inflen los resultados.
     """
     df = pd.read_sql("""
         SELECT
@@ -82,7 +104,7 @@ def load_signals(engine) -> pd.DataFrame:
             s.expected_multiple,
             s.ev_score,
             s.signal_tier,
-            s.outcome_label          AS label,
+            s.outcome_label      AS label,
             cp.max_multiple,
             cp.rug_detected,
             c.created_at
@@ -97,6 +119,16 @@ def load_signals(engine) -> pd.DataFrame:
     df["ev_score"]     = df["ev_score"].fillna(0.0).astype(float)
     df["model_score"]  = df["model_score"].fillna(0.0).astype(float)
 
+    # Deduplicar por coin_address: la tabla signals no tiene UNIQUE
+    # constraint en coin_address, por lo que múltiples ejecuciones de
+    # model.py pueden generar filas duplicadas que inflan los resultados.
+    n_before = len(df)
+    df = df.drop_duplicates(subset=["coin_address"]).reset_index(drop=True)
+    n_after = len(df)
+    if n_before > n_after:
+        print(f"  ⚠ Eliminadas {n_before - n_after:,} filas duplicadas "
+              f"(coin_address repetido en tabla signals).")
+
     print(f"  {len(df):,} señales del test set")
     print(f"  Positivos: {int(df['label'].sum())} ({df['label'].mean():.1%})")
     print(f"  Con EV > 0: {(df['ev_score'] > 0).sum():,}")
@@ -107,37 +139,29 @@ def load_signals(engine) -> pd.DataFrame:
 
 def simulate_pnl(
     label: int,
-    max_multiple,
+    max_multiple,        # mantenido en firma por compatibilidad, no se usa
     rug_detected: bool,
     slippage: float = SLIPPAGE,
 ) -> float:
     """
     P&L neto por unidad apostada dado el outcome real.
 
-    Supuestos:
-    - label=1        → exit al take profit (2.5x)
-    - label=0 + rug  → exit al 15% del entry (pérdida casi total)
-    - label=0 no-rug → exit al max(min(max_multiple, 2.5x), 0.5x)
-      ⚠ Optimista: asume salida cerca del máximo histórico.
+    Escenarios:
+    - label=1              → exit al take profit (TAKE_PROFIT_X)
+    - label=0 + rug        → exit a RUG_RECOVERY del precio de entrada
+    - label=0 sin rug      → exit a NOLABEL_EXIT_MULTIPLIER del precio de entrada
+                              (stop loss fijo, más realista que salir en el máximo)
     """
     entry = 1.0 + slippage
 
     if label == 1:
         exit_val = TAKE_PROFIT_X * (1.0 - slippage)
-
     elif bool(rug_detected):
         exit_val = RUG_RECOVERY * (1.0 - slippage)
-
     else:
-        mm = (
-            float(max_multiple)
-            if max_multiple is not None and not np.isnan(float(max_multiple))
-            else 1.0
-        )
-        effective = max(min(mm, TAKE_PROFIT_X), STOP_LOSS_FRAC)
-        exit_val  = effective * (1.0 - slippage)
+        exit_val = NOLABEL_EXIT_MULTIPLIER * (1.0 - slippage)
 
-    return exit_val - entry
+    return (exit_val - entry) * TRADE_SIZE
 
 
 # ── Métricas ───────────────────────────────────────────────────
@@ -200,14 +224,14 @@ def print_results_table(metrics_list: list):
         if m.get("n_signals", 0) == 0:
             print(f"  {m['strategy']:<33}  (sin señales)")
             continue
-        ok = "✓" if m["avg_pnl"] > 0 else " "
+        ok = "✓" if m["avg_pnl"] > 0 else "✗"
         print(
             f"  {ok}{m['strategy']:<32} {m['n_signals']:>7,} "
             f"{m['win_rate']:>8.1%} {m['avg_pnl']:>+9.4f} "
             f"{m['total_pnl']:>+8.2f} {m['sharpe']:>7.2f} "
             f"{m['max_dd']:>7.2f} {m['kelly_frac']:>8.2%}"
         )
-    print("  ✓ = P&L positivo por señal")
+    print("  ✓ = P&L positivo  ✗ = P&L negativo")
 
 
 # ── Output: evolución P&L ──────────────────────────────────────
@@ -228,19 +252,22 @@ def print_pnl_evolution(df: pd.DataFrame, strategies: dict):
 # ── Output: desglose mensual ───────────────────────────────────
 
 def print_monthly_breakdown(df: pd.DataFrame, mask, strategy_name: str):
-    """Desglose mensual de la estrategia indicada."""
+    """
+    Desglose mensual de la estrategia indicada.
+    Usa strftime en lugar de to_period para evitar duplicados
+    en el groupby con índices Period en algunas versiones de pandas.
+    """
     subset = df[mask].copy()
     if len(subset) < 5:
         return
 
-    # Convertir a período mensual (maneja timestamps con timezone)
     dt = pd.to_datetime(subset["created_at"])
     if dt.dt.tz is not None:
         dt = dt.dt.tz_convert(None)
-    subset["month"] = dt.dt.to_period("M")
+    subset["month"] = dt.dt.strftime("%Y-%m")
 
     monthly = (
-        subset.groupby("month")
+        subset.groupby("month", sort=True)
         .agg(
             n_signals = ("pnl", "count"),
             n_wins    = ("label", "sum"),
@@ -248,6 +275,7 @@ def print_monthly_breakdown(df: pd.DataFrame, mask, strategy_name: str):
             avg_pnl   = ("pnl", "mean"),
         )
         .reset_index()
+        .drop_duplicates(subset=["month"])
     )
 
     print(f"\n  Desglose mensual — {strategy_name}:")
@@ -255,7 +283,7 @@ def print_monthly_breakdown(df: pd.DataFrame, mask, strategy_name: str):
           f"{'TotalPnL':>10} {'AvgPnL':>9}")
     print("  " + "─" * 50)
     for _, row in monthly.iterrows():
-        ok = "✓" if row.avg_pnl > 0 else " "
+        ok = "✓" if row.avg_pnl > 0 else "✗"
         print(f"  {ok}{str(row.month):<9} {int(row.n_signals):>8} "
               f"{int(row.n_wins):>6} {row.total_pnl:>+10.2f} "
               f"{row.avg_pnl:>+9.4f}")
@@ -265,27 +293,25 @@ def print_monthly_breakdown(df: pd.DataFrame, mask, strategy_name: str):
 
 def print_tier_analysis(df: pd.DataFrame):
     """Precisión y P&L real por tier asignado por el modelo."""
-    tiers = ["high", "medium", "low", None]
     print("\n  Análisis por tier (EV-based):")
     print(f"  {'Tier':<12} {'N':>6} {'WinRate':>8} {'AvgPnL':>9} {'TotalPnL':>10}")
     print("  " + "─" * 50)
 
-    for tier in tiers:
+    for tier in ["high", "medium", "low", None]:
         if tier is None:
-            mask = df["signal_tier"].isna()
-            label = "sin_señal"
+            subset = df[df["signal_tier"].isna()]
+            label  = "sin_señal"
         else:
-            mask  = df["signal_tier"] == tier
-            label = tier
+            subset = df[df["signal_tier"] == tier]
+            label  = tier
 
-        subset = df[mask]
         if len(subset) == 0:
             continue
 
-        win_rate  = subset["label"].mean()
-        avg_pnl   = subset["pnl"].mean()
-        total_pnl = subset["pnl"].sum()
-        ok = "✓" if avg_pnl > 0 else " "
+        win_rate  = float(subset["label"].mean())
+        avg_pnl   = float(subset["pnl"].mean())
+        total_pnl = float(subset["pnl"].sum())
+        ok = "✓" if avg_pnl > 0 else "✗"
 
         print(f"  {ok}{label:<11} {len(subset):>6,} {win_rate:>8.1%} "
               f"{avg_pnl:>+9.4f} {total_pnl:>+10.2f}")
@@ -295,7 +321,6 @@ def print_tier_analysis(df: pd.DataFrame):
 
 def run_backtest(df: pd.DataFrame, metadata: dict) -> list:
 
-    # Calcular P&L real por trade
     df = df.copy()
     df["pnl"] = [
         simulate_pnl(row.label, row.max_multiple, row.rug_detected)
@@ -318,37 +343,32 @@ def run_backtest(df: pd.DataFrame, metadata: dict) -> list:
         for name, mask in strategies.items()
     ]
 
-    # ── Tabla principal ───────────────────────────────────────
     print("\n" + "=" * 100)
     print("RESULTADOS BACKTESTING")
     print(
         f"  Slippage: {SLIPPAGE:.0%}  |  Take profit: {TAKE_PROFIT_X}x  |  "
-        f"Stop loss floor: {STOP_LOSS_FRAC}x  |  Rug recovery: {RUG_RECOVERY}x"
+        f"Exit label=0 no-rug: {NOLABEL_EXIT_MULTIPLIER:.0%}  |  Rug recovery: {RUG_RECOVERY:.0%} | "
+        f"Trade size: {TRADE_SIZE}"
     )
     print(f"  Break-even precision: {PRECISION_BREAKEVEN:.1%}")
     print("=" * 100)
 
     print_results_table(metrics_list)
-
-    # ── Evolución P&L ─────────────────────────────────────────
     print_pnl_evolution(df, strategies)
 
-    # ── Desglose mensual para la estrategia óptima ────────────
     opt_name = f"Score ≥ {opt_t:.2f} (óptimo)"
     if opt_name in strategies:
         print_monthly_breakdown(df, strategies[opt_name], opt_name)
 
-    # ── Análisis por tier ─────────────────────────────────────
     print_tier_analysis(df)
 
-    # ── Notas sobre supuestos ─────────────────────────────────
     print("\n  ⚠  Supuestos del backtesting:")
-    print("     · label=0 no rug → salida asumida al máximo histórico (OPTIMISTA).")
-    print("       En producción real saldrás antes o después del pico.")
-    print("     · label=0 rug   → recuperación del 15% del capital.")
-    print("     · Slippage 3% aplicado en entrada y salida.")
+    print(f"     · label=0 no rug → salida fija al {NOLABEL_EXIT_MULTIPLIER:.0%} del precio de entrada.")
+    print("       Representa un stop loss realista: no es posible vender en el máximo.")
+    print(f"     · label=0 rug    → recuperación del {RUG_RECOVERY:.0%} del capital.")
+    print(f"     · Slippage {SLIPPAGE:.0%} aplicado en entrada y salida.")
     print("     · Sin costes de gas ni impacto de liquidez.")
-    print("     · Cada señal = 1 unidad de capital (sin sizing).")
+    print(f"     · Cada señal = {TRADE_SIZE} unidad(es) de capital.")
 
     return metrics_list
 
@@ -356,15 +376,16 @@ def run_backtest(df: pd.DataFrame, metadata: dict) -> list:
 def main():
     print("=" * 60)
     print("BACKTESTING DETALLADO")
+    print(f"  Modelo P&L: exit label=0 no-rug = {NOLABEL_EXIT_MULTIPLIER:.0%} entrada")
+    print(f"  Break-even precision: {PRECISION_BREAKEVEN:.1%}")
     print("=" * 60)
 
     engine   = get_engine()
     metadata = load_metadata()
 
     if metadata:
-        print(f"\n  Modelo entrenado: {metadata.get('trained_at', '—')}")
+        print(f"\n  Modelo entrenado:       {metadata.get('trained_at', '—')}")
         print(f"  Umbral óptimo guardado: {metadata.get('optimal_threshold', '—')}")
-        print(f"  Break-even precision:   {metadata.get('precision_breakeven', '—')}")
 
     print("\n[1/2] Cargando señales del test set...")
     df = load_signals(engine)

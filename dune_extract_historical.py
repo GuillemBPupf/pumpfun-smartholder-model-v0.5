@@ -249,10 +249,12 @@ def filepath_prices(d: date) -> str:
     return os.path.join(DIR_PRICES, f"prices_{d.strftime('%Y%m%d')}.csv")
 
 
+# CAMBIO TEMPORAL
 def process_day_trades(rotator: KeyRotator, d: date) -> int | None:
     fp = filepath_trades(d)
     if os.path.exists(fp):
-        n = len(pd.read_csv(fp))
+        n = 1
+        #n = len(pd.read_csv(fp))
         log.info(f"  TRADES {d} | YA EXISTE ({n:,} filas)")
         return n
 
