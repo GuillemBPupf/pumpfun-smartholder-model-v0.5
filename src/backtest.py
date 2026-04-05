@@ -15,13 +15,14 @@ Estrategias analizadas:
 
 Métricas por estrategia:
   - Precisión (win rate real sobre señales emitidas)
-  - P&L medio por señal y P&L total acumulado
-  - Sharpe simplificado
-  - Max drawdown sobre P&L acumulado
-  - Fractional Kelly recomendado (Kelly/4)
+  - P&L medio por unidad apostada (AvgPnL/u)
+  - Capital total = sum(pnl_por_unidad) × TRADE_SIZE
+  - Sharpe simplificado (dimensionless, calculado sobre valores unitarios)
+  - Max drawdown en capital (× TRADE_SIZE)
+  - Fractional Kelly recomendado (Kelly/4, dimensionless)
 
 Output adicional:
-  - Evolución del P&L acumulado (inicio → fin → pico → valle)
+  - Evolución del P&L acumulado en capital
   - Desglose mensual de la estrategia óptima
   - Análisis real por tier (EV-based)
 
@@ -32,9 +33,8 @@ Output adicional:
                           Representa un stop loss realista: no puedes
                           vender en el máximo histórico.
 
-  La versión anterior asumía salida al máximo histórico para label=0
-  sin rug, lo que generaba P&L positivo incluso en monedas perdedoras
-  (OPTIMISTA e irreal para producción).
+  simulate_pnl() devuelve P&L por unidad (no escalado por TRADE_SIZE).
+  TRADE_SIZE solo se aplica en la columna Capital del output.
 
 Uso:
     python src/backtest.py
@@ -53,12 +53,13 @@ load_dotenv()
 SLIPPAGE                = 0.03   # slippage entrada + salida
 TAKE_PROFIT_X           = 2.5    # múltiplo objetivo (coincide con label=1)
 RUG_RECOVERY            = 0.15   # fracción recuperada en rug
-NOLABEL_EXIT_MULTIPLIER = 0.80   # salida fija para label=0 sin rug # (stop loss ~20% por debajo de entrada)
-TRADE_SIZE              = 50
+NOLABEL_EXIT_MULTIPLIER = 0.80   # salida fija para label=0 sin rug
+                                  # (stop loss ~20% por debajo de entrada)
+TRADE_SIZE              = 50     # capital base por señal (en unidades monetarias)
 
 # Pérdida media estimada cuando la señal fracasa (para fórmula EV):
-#   42% rugs     → pnl ≈ -0.88
-#   58% no-rugs  → pnl = NOLABEL_EXIT_MULTIPLIER × (1-slip) - (1+slip) ≈ -0.25
+#   42% rugs     → pnl/u ≈ -0.88
+#   58% no-rugs  → pnl/u = NOLABEL_EXIT_MULTIPLIER × (1-slip) - (1+slip) ≈ -0.25
 #   Promedio: 0.42 × (-0.88) + 0.58 × (-0.25) ≈ -0.52
 AVG_LOSS_ON_FAILURE = -0.52
 
@@ -124,7 +125,7 @@ def load_signals(engine) -> pd.DataFrame:
     # model.py pueden generar filas duplicadas que inflan los resultados.
     n_before = len(df)
     df = df.drop_duplicates(subset=["coin_address"]).reset_index(drop=True)
-    n_after = len(df)
+    n_after  = len(df)
     if n_before > n_after:
         print(f"  ⚠ Eliminadas {n_before - n_after:,} filas duplicadas "
               f"(coin_address repetido en tabla signals).")
@@ -144,13 +145,19 @@ def simulate_pnl(
     slippage: float = SLIPPAGE,
 ) -> float:
     """
-    P&L neto por unidad apostada dado el outcome real.
+    P&L neto POR UNIDAD APOSTADA dado el outcome real.
+    NO se multiplica por TRADE_SIZE aquí; eso ocurre solo en el output.
 
     Escenarios:
     - label=1              → exit al take profit (TAKE_PROFIT_X)
     - label=0 + rug        → exit a RUG_RECOVERY del precio de entrada
     - label=0 sin rug      → exit a NOLABEL_EXIT_MULTIPLIER del precio de entrada
                               (stop loss fijo, más realista que salir en el máximo)
+
+    Ejemplo con SLIPPAGE=3%:
+      label=1   → exit 2.5×0.97 - 1.03 = +1.395 por unidad
+      rug       → exit 0.15×0.97 - 1.03 = -0.884 por unidad
+      no-rug    → exit 0.80×0.97 - 1.03 = -0.254 por unidad
     """
     entry = 1.0 + slippage
 
@@ -161,33 +168,38 @@ def simulate_pnl(
     else:
         exit_val = NOLABEL_EXIT_MULTIPLIER * (1.0 - slippage)
 
-    return (exit_val - entry) * TRADE_SIZE
+    return exit_val - entry   # per-unit, sin escalar por TRADE_SIZE
 
 
 # ── Métricas ───────────────────────────────────────────────────
 
 def compute_metrics(subset: pd.DataFrame, name: str) -> dict:
-    """Calcula métricas completas de rentabilidad para un subconjunto."""
+    """
+    Calcula métricas de rentabilidad para un subconjunto de señales.
+    Todos los valores de P&L se trabajan en unidades base (per-unit).
+    TRADE_SIZE solo se aplica al mostrar el Capital total en pantalla.
+    """
     if len(subset) == 0:
         return {"strategy": name, "n_signals": 0}
 
-    pnls   = subset["pnl"].values
+    pnls   = subset["pnl"].values   # per-unit
     labels = subset["label"].values
     n      = len(pnls)
 
-    avg_pnl   = float(np.mean(pnls))
-    total_pnl = float(np.sum(pnls))
-    std_pnl   = float(np.std(pnls) + 1e-9)
-    sharpe    = avg_pnl / std_pnl * np.sqrt(n)
-    win_rate  = float(np.mean(labels))
-    n_wins    = int(np.sum(labels))
+    avg_pnl      = float(np.mean(pnls))          # por unidad
+    total_pnl_pu = float(np.sum(pnls))           # suma por unidad
+    total_capital = total_pnl_pu * TRADE_SIZE     # en capital real
+    std_pnl      = float(np.std(pnls) + 1e-9)
+    sharpe       = avg_pnl / std_pnl * np.sqrt(n)  # dimensionless
+    win_rate     = float(np.mean(labels))
+    n_wins       = int(np.sum(labels))
 
-    # Max drawdown sobre P&L acumulado cronológico
+    # Max drawdown sobre P&L acumulado (per-unit) → convertido a capital
     cum         = np.cumsum(pnls)
     rolling_max = np.maximum.accumulate(cum)
-    max_dd      = float(np.max(rolling_max - cum)) if len(cum) > 0 else 0.0
+    max_dd      = float(np.max(rolling_max - cum)) * TRADE_SIZE if len(cum) > 0 else 0.0
 
-    # Fractional Kelly (Kelly/4 para seguridad)
+    # Fractional Kelly (Kelly/4) — dimensionless, calculado per-unit
     wins_pnl   = pnls[labels == 1]
     losses_pnl = pnls[labels == 0]
     if len(wins_pnl) > 0 and len(losses_pnl) > 0 and wins_pnl.mean() > 0:
@@ -199,26 +211,37 @@ def compute_metrics(subset: pd.DataFrame, name: str) -> dict:
         kelly_frac = 0.0
 
     return {
-        "strategy":   name,
-        "n_signals":  n,
-        "n_wins":     n_wins,
-        "win_rate":   win_rate,
-        "avg_pnl":    avg_pnl,
-        "total_pnl":  total_pnl,
-        "sharpe":     sharpe,
-        "max_dd":     max_dd,
-        "kelly_frac": kelly_frac,
+        "strategy":      name,
+        "n_signals":     n,
+        "n_wins":        n_wins,
+        "win_rate":      win_rate,
+        "avg_pnl":       avg_pnl,        # por unidad
+        "total_capital": total_capital,   # en capital (× TRADE_SIZE)
+        "sharpe":        sharpe,
+        "max_dd":        max_dd,          # en capital (× TRADE_SIZE)
+        "kelly_frac":    kelly_frac,
     }
 
 
 # ── Output: tabla de resultados ────────────────────────────────
 
 def print_results_table(metrics_list: list):
+    """
+    Columnas:
+      AvgPnL/u  → P&L medio por unidad apostada (fracción, e.g. +0.20)
+      Capital   → P&L total en capital = sum(pnl/u) × TRADE_SIZE
+      MaxDD     → max drawdown en capital
+    """
+    size_label = f"×{TRADE_SIZE}"
     header = (f"  {'Estrategia':<33} {'N':>7} {'WinRate':>8} "
-              f"{'AvgPnL':>9} {'Total':>8} {'Sharpe':>7} "
-              f"{'MaxDD':>7} {'Kelly/4':>8}")
+              f"{'AvgPnL/u':>9} {'Capital':>10} {'Sharpe':>7} "
+              f"{'MaxDD':>8} {'Kelly/4':>8}")
+    subhdr = (f"  {'':33} {'':7} {'':8} "
+              f"{'':9} {size_label:>10} {'':7} "
+              f"{size_label:>8} {'':8}")
     print(header)
-    print("  " + "─" * 95)
+    print(subhdr)
+    print("  " + "─" * 100)
 
     for m in metrics_list:
         if m.get("n_signals", 0) == 0:
@@ -228,25 +251,29 @@ def print_results_table(metrics_list: list):
         print(
             f"  {ok}{m['strategy']:<32} {m['n_signals']:>7,} "
             f"{m['win_rate']:>8.1%} {m['avg_pnl']:>+9.4f} "
-            f"{m['total_pnl']:>+8.2f} {m['sharpe']:>7.2f} "
-            f"{m['max_dd']:>7.2f} {m['kelly_frac']:>8.2%}"
+            f"{m['total_capital']:>+10.2f} {m['sharpe']:>7.2f} "
+            f"{m['max_dd']:>8.2f} {m['kelly_frac']:>8.2%}"
         )
-    print("  ✓ = P&L positivo  ✗ = P&L negativo")
+    print("  ✓ = P&L/u positivo  ✗ = P&L/u negativo")
 
 
 # ── Output: evolución P&L ──────────────────────────────────────
 
 def print_pnl_evolution(df: pd.DataFrame, strategies: dict):
-    """Curva de P&L acumulado resumida por estrategia."""
-    print("\n  Evolución P&L acumulado (inicio=0):")
-    print(f"  {'Estrategia':<33} {'Final':>8} {'Pico':>8} {'Valle':>8}")
+    """
+    Curva de P&L acumulado en capital (per-unit × TRADE_SIZE).
+    Separado en print() propio para evitar artefactos de terminal con \\n.
+    """
+    print()
+    print(f"  Evolución capital acumulado (inicio=0, ×{TRADE_SIZE}):")
+    print(f"  {'Estrategia':<33} {'Final':>9} {'Pico':>9} {'Valle':>9}")
     print("  " + "─" * 65)
     for name, mask in strategies.items():
         subset = df[mask].sort_values("created_at")
         if len(subset) < 2:
             continue
-        cum = np.cumsum(subset["pnl"].values)
-        print(f"  {name:<33} {cum[-1]:>+8.2f} {cum.max():>+8.2f} {cum.min():>+8.2f}")
+        cum = np.cumsum(subset["pnl"].values) * TRADE_SIZE  # en capital
+        print(f"  {name:<33} {cum[-1]:>+9.2f} {cum.max():>+9.2f} {cum.min():>+9.2f}")
 
 
 # ── Output: desglose mensual ───────────────────────────────────
@@ -256,6 +283,7 @@ def print_monthly_breakdown(df: pd.DataFrame, mask, strategy_name: str):
     Desglose mensual de la estrategia indicada.
     Usa strftime en lugar de to_period para evitar duplicados
     en el groupby con índices Period en algunas versiones de pandas.
+    Capital = sum(pnl/u) × TRADE_SIZE.
     """
     subset = df[mask].copy()
     if len(subset) < 5:
@@ -269,33 +297,40 @@ def print_monthly_breakdown(df: pd.DataFrame, mask, strategy_name: str):
     monthly = (
         subset.groupby("month", sort=True)
         .agg(
-            n_signals = ("pnl", "count"),
-            n_wins    = ("label", "sum"),
-            total_pnl = ("pnl", "sum"),
-            avg_pnl   = ("pnl", "mean"),
+            n_signals    = ("pnl", "count"),
+            n_wins       = ("label", "sum"),
+            total_pnl_pu = ("pnl", "sum"),    # per-unit
+            avg_pnl_pu   = ("pnl", "mean"),   # per-unit
         )
         .reset_index()
         .drop_duplicates(subset=["month"])
     )
+    monthly["capital"] = monthly["total_pnl_pu"] * TRADE_SIZE
 
-    print(f"\n  Desglose mensual — {strategy_name}:")
+    print()
+    print(f"  Desglose mensual — {strategy_name}:")
     print(f"  {'Mes':<10} {'Señales':>8} {'Wins':>6} "
-          f"{'TotalPnL':>10} {'AvgPnL':>9}")
-    print("  " + "─" * 50)
+          f"{'Capital':>10} {'AvgPnL/u':>10}")
+    print("  " + "─" * 52)
     for _, row in monthly.iterrows():
-        ok = "✓" if row.avg_pnl > 0 else "✗"
+        ok = "✓" if row.avg_pnl_pu > 0 else "✗"
         print(f"  {ok}{str(row.month):<9} {int(row.n_signals):>8} "
-              f"{int(row.n_wins):>6} {row.total_pnl:>+10.2f} "
-              f"{row.avg_pnl:>+9.4f}")
+              f"{int(row.n_wins):>6} {row.capital:>+10.2f} "
+              f"{row.avg_pnl_pu:>+10.4f}")
 
 
 # ── Output: análisis de tiers ──────────────────────────────────
 
 def print_tier_analysis(df: pd.DataFrame):
-    """Precisión y P&L real por tier asignado por el modelo."""
-    print("\n  Análisis por tier (EV-based):")
-    print(f"  {'Tier':<12} {'N':>6} {'WinRate':>8} {'AvgPnL':>9} {'TotalPnL':>10}")
-    print("  " + "─" * 50)
+    """
+    Precisión y P&L real por tier asignado por el modelo.
+    Capital = sum(pnl/u) × TRADE_SIZE.
+    """
+    print()
+    print("  Análisis por tier (EV-based):")
+    print(f"  {'Tier':<12} {'N':>6} {'WinRate':>8} "
+          f"{'AvgPnL/u':>10} {'Capital':>10}")
+    print("  " + "─" * 52)
 
     for tier in ["high", "medium", "low", None]:
         if tier is None:
@@ -310,17 +345,18 @@ def print_tier_analysis(df: pd.DataFrame):
 
         win_rate  = float(subset["label"].mean())
         avg_pnl   = float(subset["pnl"].mean())
-        total_pnl = float(subset["pnl"].sum())
+        capital   = float(subset["pnl"].sum()) * TRADE_SIZE
         ok = "✓" if avg_pnl > 0 else "✗"
 
         print(f"  {ok}{label:<11} {len(subset):>6,} {win_rate:>8.1%} "
-              f"{avg_pnl:>+9.4f} {total_pnl:>+10.2f}")
+              f"{avg_pnl:>+10.4f} {capital:>+10.2f}")
 
 
 # ── Pipeline principal ─────────────────────────────────────────
 
 def run_backtest(df: pd.DataFrame, metadata: dict) -> list:
 
+    # Calcular P&L per-unit por trade (sin TRADE_SIZE)
     df = df.copy()
     df["pnl"] = [
         simulate_pnl(row.label, row.max_multiple, row.rug_detected)
@@ -343,15 +379,18 @@ def run_backtest(df: pd.DataFrame, metadata: dict) -> list:
         for name, mask in strategies.items()
     ]
 
-    print("\n" + "=" * 100)
+    print()
+    print("=" * 105)
     print("RESULTADOS BACKTESTING")
     print(
         f"  Slippage: {SLIPPAGE:.0%}  |  Take profit: {TAKE_PROFIT_X}x  |  "
-        f"Exit label=0 no-rug: {NOLABEL_EXIT_MULTIPLIER:.0%}  |  Rug recovery: {RUG_RECOVERY:.0%} | "
-        f"Trade size: {TRADE_SIZE}"
+        f"Exit label=0 no-rug: {NOLABEL_EXIT_MULTIPLIER:.0%}  |  "
+        f"Rug recovery: {RUG_RECOVERY:.0%}  |  Trade size: {TRADE_SIZE}"
     )
-    print(f"  Break-even precision: {PRECISION_BREAKEVEN:.1%}")
-    print("=" * 100)
+    print(f"  Break-even precision: {PRECISION_BREAKEVEN:.1%}  |  "
+          f"AvgPnL/u = P&L por unidad apostada  |  "
+          f"Capital = total × {TRADE_SIZE}")
+    print("=" * 105)
 
     print_results_table(metrics_list)
     print_pnl_evolution(df, strategies)
@@ -362,13 +401,14 @@ def run_backtest(df: pd.DataFrame, metadata: dict) -> list:
 
     print_tier_analysis(df)
 
-    print("\n  ⚠  Supuestos del backtesting:")
+    print()
+    print("  ⚠  Supuestos del backtesting:")
     print(f"     · label=0 no rug → salida fija al {NOLABEL_EXIT_MULTIPLIER:.0%} del precio de entrada.")
     print("       Representa un stop loss realista: no es posible vender en el máximo.")
     print(f"     · label=0 rug    → recuperación del {RUG_RECOVERY:.0%} del capital.")
     print(f"     · Slippage {SLIPPAGE:.0%} aplicado en entrada y salida.")
     print("     · Sin costes de gas ni impacto de liquidez.")
-    print(f"     · Cada señal = {TRADE_SIZE} unidad(es) de capital.")
+    print(f"     · Trade size: {TRADE_SIZE} unidades de capital por señal.")
 
     return metrics_list
 
@@ -378,6 +418,7 @@ def main():
     print("BACKTESTING DETALLADO")
     print(f"  Modelo P&L: exit label=0 no-rug = {NOLABEL_EXIT_MULTIPLIER:.0%} entrada")
     print(f"  Break-even precision: {PRECISION_BREAKEVEN:.1%}")
+    print(f"  Trade size: {TRADE_SIZE} unidades por señal")
     print("=" * 60)
 
     engine   = get_engine()
@@ -397,7 +438,8 @@ def main():
     print("\n[2/2] Ejecutando backtesting...")
     run_backtest(df, metadata)
 
-    print("\n" + "=" * 60)
+    print()
+    print("=" * 60)
     print("COMPLETADO")
     print("=" * 60)
 

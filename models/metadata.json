@@ -23,12 +23,12 @@
     "day_of_week"
   ],
   "train_ratio": 0.8,
-  "trained_at": "2026-04-03T11:01:00.974665+00:00",
+  "trained_at": "2026-04-05T09:34:02.266728+00:00",
   "optimal_threshold": 0.1406,
   "precision_breakeven": 0.2715,
   "slippage": 0.03,
   "take_profit_x": 2.5,
-  "stop_loss_frac": 0.19999999999999996,
+  "nolabel_exit": 0.8,
   "avg_loss_on_failure": -0.52,
   "trade_size": 50,
   "backtest_summary": {
@@ -37,8 +37,8 @@
       "n_signals": 10444,
       "n_wins": 447,
       "precision": 0.0428,
-      "avg_pnl": -13.333649,
-      "total_pnl": -139256.625,
+      "avg_pnl_pu": -0.266673,
+      "total_capital": -139256.62,
       "sharpe": -66.3503
     },
     "\u00d3ptimo (0.14)": {
@@ -46,8 +46,8 @@
       "n_signals": 18,
       "n_wins": 5,
       "precision": 0.2778,
-      "avg_pnl": 10.202778,
-      "total_pnl": 183.65,
+      "avg_pnl_pu": 0.204056,
+      "total_capital": 183.65,
       "sharpe": 1.1721
     }
   }

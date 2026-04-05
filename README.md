@@ -2,7 +2,6 @@ tengo pensado volver a cargas los csv de prices (solo los de prices) ya que al s
 principalmente quiero añadirles el precio de la coin cada 5 minutos durante esas 4 primeras horas para así tener unos datos mucho mas completos de los precios y poder obtener mejores features y tambien test y backtesting mucho mas realista (ademas creo que no deberia hacer crecer demasiado el consumo de creditos ya que el numero de filas seria igual al anterior)
 que mas cosas interesantes se te ocurre que podamos añadir a los csv de prices para que así podamos añadir features interesantes mas adelante
 
-
 COSAS QUE HACER POR ORDEN:
 
 1- MANDARLE A LA SEGUNDA CUENTA DE CLAUDE LOS RESULTADOS OBTENIDOS PARA QUE LOS ANALICE
@@ -22,6 +21,7 @@ COSAS QUE HACER POR ORDEN:
 
 -   tambien hacer un sistema (esto ya para el real-time) que vaya recalculando el score de la moneda segun van saliendo y entrando holders para mejorar la precision de que hacer en cada momento (si salen todos los smart holders vender, si entran mas comprar mas o aumentar el punto de take profit, etc)
 
+5- RECUERDA ARREGLAR EL DUNE_EXTRACT_HISTORICAL (EL CAMBIO TEMPORAL PARA QUE TARDE MENOS)
 
 ----IDAEAS DE MEJORA DEL MODELO-------
 

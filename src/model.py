@@ -60,12 +60,12 @@ SLIPPAGE                = 0.03   # slippage de entrada y salida (3%)
 TAKE_PROFIT_X           = 2.5    # múltiplo de take profit (coincide con label=1)
 RUG_RECOVERY            = 0.15   # fracción recuperada si hay rug
 NOLABEL_EXIT_MULTIPLIER = 0.80   # salida fija para label=0 sin rug
-STOP_LOSS_FRAC          = 1 - NOLABEL_EXIT_MULTIPLIER # (stop loss ~20% por debajo de entrada) Más realista que asumir salida en el máximo histórico.
-TRADE_SIZE              = 50
+                                  # (stop loss ~20% por debajo de entrada)
+TRADE_SIZE              = 50     # capital base por señal (solo para display de Capital)
 
 # Pérdida media estimada cuando la señal fracasa (para fórmula EV):
-#   42% rugs     → pnl ≈ -0.88
-#   58% no-rugs  → pnl = NOLABEL_EXIT_MULTIPLIER × (1-slip) - (1+slip) ≈ -0.25
+#   42% rugs     → pnl/u ≈ -0.88
+#   58% no-rugs  → pnl/u = NOLABEL_EXIT_MULTIPLIER × (1-slip) - (1+slip) ≈ -0.25
 #   Promedio: 0.42 × (-0.88) + 0.58 × (-0.25) ≈ -0.52
 AVG_LOSS_ON_FAILURE = -0.52
 
@@ -78,7 +78,7 @@ THRESHOLD_FALLBACK = 0.50
 # Break-even precision:
 #   EV=0  →  P × gain_éxito = (1-P) × |AVG_LOSS_ON_FAILURE|
 #   gain_éxito = 2.5×(1-slip) - (1+slip) = 1.395 con slip=3%
-#   P_be = 0.52 / (1.395 + 0.52) ≈ 27.1%
+#   P_be = 0.52 / (1.395 + 0.52) ≈ 27.2%
 _GAIN_SUCCESS       = TAKE_PROFIT_X * (1 - SLIPPAGE) - (1 + SLIPPAGE)
 PRECISION_BREAKEVEN = abs(AVG_LOSS_ON_FAILURE) / (_GAIN_SUCCESS + abs(AVG_LOSS_ON_FAILURE))
 
@@ -178,12 +178,13 @@ def prepare_data(df: pd.DataFrame, train_coins: set, test_coins: set):
 
 def simulate_trade_pnl(
     label: int,
-    max_multiple,        # mantenido en firma por compatibilidad, no se usa para label=0
+    max_multiple,        # mantenido en firma por compatibilidad, no se usa
     rug_detected: bool,
     slippage: float = SLIPPAGE,
 ) -> float:
     """
-    Estima el P&L neto por unidad apostada dado el outcome real.
+    P&L neto POR UNIDAD APOSTADA dado el outcome real.
+    NO se multiplica por TRADE_SIZE aquí; eso ocurre solo en el output.
 
     Escenarios:
     - label=1              → exit al take profit (TAKE_PROFIT_X)
@@ -191,9 +192,10 @@ def simulate_trade_pnl(
     - label=0 sin rug      → exit a NOLABEL_EXIT_MULTIPLIER del precio de entrada
                               (stop loss fijo ~20% por debajo de entrada)
 
-    La versión anterior usaba max_multiple como precio de salida para
-    label=0 sin rug, lo que era OPTIMISTA (asumía vender en el máximo).
-    La versión actual usa un stop loss fijo más realista.
+    Ejemplo con SLIPPAGE=3%:
+      label=1   → +1.395 por unidad
+      rug       → -0.884 por unidad
+      no-rug    → -0.254 por unidad
 
     Returns: P&L neto por unidad (>0 ganancia, <0 pérdida).
     """
@@ -206,7 +208,7 @@ def simulate_trade_pnl(
     else:
         exit_val = NOLABEL_EXIT_MULTIPLIER * (1.0 - slippage)
 
-    return round((exit_val - entry) * TRADE_SIZE, 6)
+    return round(exit_val - entry, 6)   # per-unit, sin escalar por TRADE_SIZE
 
 
 # ── EV por señal (para producción) ────────────────────────────
@@ -218,10 +220,10 @@ def compute_ev(p_calib: float, slippage: float = SLIPPAGE) -> float:
 
     EV = P × ganancia_si_éxito + (1-P) × pérdida_media_si_fracaso
 
-    - ganancia_si_éxito   = TAKE_PROFIT_X × (1-slip) - (1+slip)  ≈  1.395
-    - pérdida_media_si_fracaso  = AVG_LOSS_ON_FAILURE  ≈  -0.55
+    - ganancia_si_éxito        = 2.5×(1-slip) - (1+slip)  ≈  +1.395
+    - pérdida_media_si_fracaso = AVG_LOSS_ON_FAILURE       ≈  -0.52
 
-    Break-even: P ≈ 28.3% (ver PRECISION_BREAKEVEN)
+    Break-even: P ≈ 27.2% (ver PRECISION_BREAKEVEN)
     """
     gain = TAKE_PROFIT_X * (1.0 - slippage) - (1.0 + slippage)
     ev   = p_calib * gain + (1.0 - p_calib) * AVG_LOSS_ON_FAILURE
@@ -272,18 +274,13 @@ def train_classifier(X_train, X_test, y_train, y_test):
 
 # ── Calibración ────────────────────────────────────────────────
 
-def calibrate_classifier(
-    proba_raw: np.ndarray,
-    y_test,
-) -> tuple:
+def calibrate_classifier(proba_raw: np.ndarray, y_test) -> tuple:
     """
     Calibra las probabilidades brutas con isotonic regression
     ajustada sobre el test set.
 
     ⚠ Limitación: se calibra sobre el mismo test usado para evaluar.
     Con más datos, lo correcto es usar un val set separado.
-    La calibración corrige el sesgo sistemático de las probabilidades
-    XGBoost con datos muy desbalanceados.
     """
     calibrator = IsotonicRegression(out_of_bounds="clip")
     calibrator.fit(proba_raw, y_test)
@@ -310,10 +307,10 @@ def find_optimal_threshold(
 ) -> tuple:
     """
     Busca el umbral de probabilidad calibrada que maximiza
-    el avg P&L por señal emitida (usando outcomes reales del test).
+    el avg P&L por unidad por señal emitida.
 
     Itera sobre 200 umbrales entre 0.02 y 0.98.
-    Sólo evalúa umbrales con al menos MIN_SIGNALS señales.
+    Solo evalúa umbrales con al menos MIN_SIGNALS señales.
 
     Returns: (mejor_umbral, DataFrame con todos los resultados)
     """
@@ -329,21 +326,22 @@ def find_optimal_threshold(
         if n < MIN_SIGNALS:
             continue
 
+        # P&L per-unit (sin TRADE_SIZE)
         pnls      = np.array([
             simulate_trade_pnl(int(y_arr[i]), m_arr[i], bool(rug_arr[i]))
             for i in idxs
         ])
-        avg_pnl   = float(pnls.mean())
-        total_pnl = float(pnls.sum())
-        precision = float(y_arr[idxs].mean())
+        avg_pnl_pu   = float(pnls.mean())
+        total_capital = float(pnls.sum()) * TRADE_SIZE
+        precision     = float(y_arr[idxs].mean())
 
         results.append({
-            "threshold":   round(float(t), 4),
-            "n_signals":   int(n),
-            "n_wins":      int(y_arr[idxs].sum()),
-            "precision":   round(precision, 4),
-            "avg_pnl":     round(avg_pnl, 6),
-            "total_pnl":   round(total_pnl, 4),
+            "threshold":     round(float(t), 4),
+            "n_signals":     int(n),
+            "n_wins":        int(y_arr[idxs].sum()),
+            "precision":     round(precision, 4),
+            "avg_pnl_pu":    round(avg_pnl_pu, 6),
+            "total_capital": round(total_capital, 2),
         })
 
     df_thresh = pd.DataFrame(results)
@@ -352,32 +350,51 @@ def find_optimal_threshold(
         print("  ⚠ No se pudo calcular umbral óptimo → usando fallback.")
         return THRESHOLD_FALLBACK, df_thresh
 
-    best_idx = df_thresh["avg_pnl"].idxmax()
+    best_idx = df_thresh["avg_pnl_pu"].idxmax()
     best     = df_thresh.loc[best_idx]
     best_t   = float(best["threshold"])
 
-    print(f"\n  Umbral óptimo (max avg P&L por señal): {best_t:.3f}")
-    print(f"    Señales en test:  {int(best['n_signals']):,}")
-    print(f"    Precisión:        {best['precision']:.1%}  "
+    print(f"\n  Umbral óptimo (max AvgPnL/u por señal): {best_t:.3f}")
+    print(f"    Señales en test:   {int(best['n_signals']):,}")
+    print(f"    Precisión:         {best['precision']:.1%}  "
           f"(break-even: {PRECISION_BREAKEVEN:.1%})")
-    print(f"    Avg P&L / señal:  {best['avg_pnl']:+.4f}")
-    print(f"    P&L total:        {best['total_pnl']:+.2f} unidades (x{TRADE_SIZE})")
+    print(f"    AvgPnL / unidad:   {best['avg_pnl_pu']:+.4f}")
+    total_pu = float(best["avg_pnl_pu"]) * int(best["n_signals"])
+    print(f"    Capital total:     {best['total_capital']:+.2f}  "
+          f"(sum P&L/u={total_pu:+.4f} × trade_size={TRADE_SIZE})")
 
-    # Tabla de umbrales clave
-    key_t = {0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80}
-    print("\n  Tabla de umbrales clave:")
+    # Tabla de umbrales clave:
+    # Para cada umbral de referencia, encontramos el índice exacto de la fila
+    # más cercana en df_thresh y lo guardamos. Así cada umbral de referencia
+    # aparece exactamente una vez, con su valor real (no aproximado).
+    key_t = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+    seen_idx = set()
+    rows_to_print = []
+
+    # Fila del óptimo siempre incluida
+    seen_idx.add(best_idx)
+    rows_to_print.append((best_idx, True))
+
+    # Para cada umbral clave, el índice de la fila más cercana
+    for kt in key_t:
+        closest_idx = (df_thresh["threshold"] - kt).abs().idxmin()
+        if closest_idx not in seen_idx:
+            seen_idx.add(closest_idx)
+            rows_to_print.append((closest_idx, False))
+
+    # Ordenar por threshold para imprimir de menor a mayor
+    rows_to_print.sort(key=lambda x: df_thresh.loc[x[0], "threshold"])
+
+    print(f"\n  Tabla de umbrales clave (Capital = sum×{TRADE_SIZE}):")
     print(f"  {'Umbral':>7} {'Señales':>8} {'Precisión':>10} "
-          f"{'AvgPnL':>9} {'TotalPnL':>10}")
-    print("  " + "─" * 50)
-    for row in df_thresh.itertuples():
-        is_best = abs(row.threshold - best_t) < 1e-4
-        in_key  = any(abs(row.threshold - kt) < 0.005 for kt in key_t)
-        if not (in_key or is_best):
-            continue
+          f"{'AvgPnL/u':>10} {'Capital':>10}")
+    print("  " + "─" * 55)
+    for idx, is_best in rows_to_print:
+        row    = df_thresh.loc[idx]
         marker = "  ←ÓPTIMO" if is_best else ""
-        print(f"  {row.threshold:>7.2f} {row.n_signals:>8,} "
-              f"{row.precision:>10.1%} {row.avg_pnl:>+9.4f} "
-              f"{row.total_pnl:>+10.2f}{marker}")
+        print(f"  {row.threshold:>7.4f} {int(row.n_signals):>8,} "
+              f"{row.precision:>10.1%} {row.avg_pnl_pu:>+10.4f} "
+              f"{row.total_capital:>+10.2f}{marker}")
 
     return best_t, df_thresh
 
@@ -391,62 +408,64 @@ def run_backtest(
     optimal_threshold: float,
 ) -> dict:
     """
-    Compara tres estrategias sobre el test set:
-      - Baseline (emitir señal para todo)
-      - Umbral óptimo calculado por find_optimal_threshold
-      - Alta confianza (umbral 0.70)
-
-    Métricas: precisión, avg P&L, P&L total, Sharpe simplificado.
+    Compara tres estrategias sobre el test set.
+    P&L per-unit internamente; Capital = sum × TRADE_SIZE en el output.
     """
     y_arr   = np.asarray(y_test)
     m_arr   = test_df["max_multiple"].values
     rug_arr = test_df["rug_detected"].values
 
     strategies = {
-        "Baseline (todo)":                       0.01,
-        f"Óptimo ({optimal_threshold:.2f})":     optimal_threshold,
-        "Alta confianza (0.70)":                 0.70,
+        "Baseline (todo)":                   0.01,
+        f"Óptimo ({optimal_threshold:.2f})": optimal_threshold,
+        "Alta confianza (0.70)":             0.70,
     }
 
     all_results = {}
 
-    print(f"\n  {'Estrategia':<30} {'Señales':>8} {'Precisión':>10} "
-          f"{'AvgPnL':>9} {'TotalPnL':>10} {'Sharpe':>7}")
+    print(f"\n  {'Estrategia':<28} {'Señales':>8} {'Precisión':>10} "
+          f"{'AvgPnL/u':>10} {'Capital':>10} {'Sharpe':>7}")
+    print(f"  {'':28} {'':8} {'':10} "
+          f"{'':10} {'(×'+str(TRADE_SIZE)+')':>10} {'':7}")
     print("  " + "─" * 80)
 
     for name, threshold in strategies.items():
         idxs = np.where(proba_calib >= threshold)[0]
         if len(idxs) == 0:
-            print(f"  {name:<30}  (sin señales con este umbral)")
+            print(f"  {name:<28}  (sin señales con este umbral)")
             continue
 
-        pnls      = np.array([
+        pnls          = np.array([
             simulate_trade_pnl(int(y_arr[i]), m_arr[i], bool(rug_arr[i]))
             for i in idxs
         ])
-        n         = len(pnls)
-        n_wins    = int(y_arr[idxs].sum())
-        avg_pnl   = float(pnls.mean())
-        total_pnl = float(pnls.sum())
-        precision = float(y_arr[idxs].mean())
-        sharpe    = avg_pnl / (pnls.std() + 1e-9) * np.sqrt(n)
+        n             = len(pnls)
+        n_wins        = int(y_arr[idxs].sum())
+        avg_pnl_pu    = float(pnls.mean())
+        total_capital = float(pnls.sum()) * TRADE_SIZE
+        precision     = float(y_arr[idxs].mean())
+        sharpe        = avg_pnl_pu / (pnls.std() + 1e-9) * np.sqrt(n)
 
-        ev_marker = " ✓" if avg_pnl > 0 else "  "
+        ev_marker = "✓" if avg_pnl_pu > 0 else " "
         all_results[name] = {
-            "threshold": threshold, "n_signals": n, "n_wins": n_wins,
-            "precision": round(precision, 4), "avg_pnl": round(avg_pnl, 6),
-            "total_pnl": round(total_pnl, 4), "sharpe": round(sharpe, 4),
+            "threshold":     threshold,
+            "n_signals":     n,
+            "n_wins":        n_wins,
+            "precision":     round(precision, 4),
+            "avg_pnl_pu":    round(avg_pnl_pu, 6),
+            "total_capital": round(total_capital, 2),
+            "sharpe":        round(sharpe, 4),
         }
 
-        print(f"  {ev_marker}{name:<28} {n:>8,} {precision:>10.1%} "
-              f"{avg_pnl:>+9.4f} {total_pnl:>+10.2f} {sharpe:>7.2f}")
+        print(f"  {ev_marker}{name:<27} {n:>8,} {precision:>10.1%} "
+              f"{avg_pnl_pu:>+10.4f} {total_capital:>+10.2f} {sharpe:>7.2f}")
 
-    print("  (✓ = P&L positivo por señal)")
+    print("  (✓ = AvgPnL/u positivo)")
 
     # Reporte clasificación con umbral óptimo
     opt_idxs = np.where(proba_calib >= optimal_threshold)[0]
     if len(opt_idxs) >= 5:
-        pred_bin        = np.zeros(len(y_arr), dtype=int)
+        pred_bin           = np.zeros(len(y_arr), dtype=int)
         pred_bin[opt_idxs] = 1
         print(f"\n  Reporte clasificación (umbral óptimo {optimal_threshold:.2f}):")
         print(classification_report(
@@ -499,18 +518,12 @@ def save_signals(
     """
     Guarda señales en la BD con probabilidad calibrada y EV.
 
-    Campos nuevos respecto a la versión anterior:
-      - model_score:  probabilidad calibrada (antes era la bruta)
-      - ev_score:     Expected Value por unidad apostada
-      - signal_tier:  asignado por EV (no por score bruto)
-
-    Tiers por EV:
+    Tiers por EV (por unidad apostada):
       'high'   → EV > 0.30
       'medium' → EV > 0.10
       'low'    → EV > 0.00
        None    → EV ≤ 0.00 (no se emite señal)
     """
-    # Mapa de índice → expected_multiple del regresor
     if pred_reg is not None:
         reg_idxs = test_df[reg_mask_test.values].index
         reg_map  = dict(zip(reg_idxs.tolist(), pred_reg.tolist()))
@@ -558,7 +571,6 @@ def save_signals(
             """), records[start:start + 1_000])
             conn.commit()
 
-    # Resumen
     n_signaled     = sum(1 for r in records if r["signal_tier"] is not None)
     n_pos_signaled = sum(1 for r in records if r["signal_tier"] is not None
                          and r["outcome_label"] == 1)
@@ -610,7 +622,7 @@ def save_models(
         "precision_breakeven":  round(PRECISION_BREAKEVEN, 4),
         "slippage":             SLIPPAGE,
         "take_profit_x":        TAKE_PROFIT_X,
-        "stop_loss_frac":       STOP_LOSS_FRAC,
+        "nolabel_exit":         NOLABEL_EXIT_MULTIPLIER,
         "avg_loss_on_failure":  AVG_LOSS_ON_FAILURE,
         "trade_size":           TRADE_SIZE,
         "backtest_summary":     backtest_results,
@@ -628,7 +640,8 @@ def main():
     print(f"  Break-even precision: {PRECISION_BREAKEVEN:.1%}")
     print(f"  Slippage asumido:     {SLIPPAGE:.0%}")
     print(f"  Take profit:          {TAKE_PROFIT_X}x")
-    print(f"  Pérdida media fallo:  {AVG_LOSS_ON_FAILURE:+.2f}")
+    print(f"  Pérdida media fallo:  {AVG_LOSS_ON_FAILURE:+.2f}/u")
+    print(f"  Trade size:           {TRADE_SIZE} (solo para display Capital)")
     print("=" * 60)
 
     engine = get_engine()
@@ -664,7 +677,7 @@ def main():
     )
 
     print("\n[5/5] Backtesting, guardado y señales...")
-    print("\n  ── Backtesting ──")
+    print("\n  ── Backtesting rápido ──")
     backtest_results = run_backtest(
         y_test, proba_calib, test_df, optimal_threshold
     )
