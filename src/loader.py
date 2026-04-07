@@ -41,7 +41,7 @@ def get_engine():
 
 def insert_batches(conn, sql, df, batch_size=10_000, label="filas"):
     """Inserta un DataFrame en lotes mostrando progreso."""
-    total = len(df)
+    total    = len(df)
     inserted = 0
     for start in range(0, total, batch_size):
         batch = df.iloc[start:start + batch_size]
@@ -126,7 +126,6 @@ def load_early_buyers(engine):
         df = pd.read_csv(filepath)
         df = clean_nil(df)
 
-        # Renombrar columnas si Dune las devuelve con nombres distintos
         rename_map = {}
         if "first_entry_seconds" not in df.columns and "seconds_since_launch" in df.columns:
             rename_map["seconds_since_launch"] = "first_entry_seconds"
@@ -145,12 +144,12 @@ def load_early_buyers(engine):
         df = df.drop_duplicates(subset=["coin_address", "wallet_address"])
 
         before = len(df)
-        df = df[df["coin_address"].isin(valid_coins)]
+        df     = df[df["coin_address"].isin(valid_coins)]
         if before - len(df) > 0:
             print(f"    {before - len(df):,} filas descartadas (coin no en BD)")
 
         if df.empty:
-            print(f"    Sin datos válidos, saltando.")
+            print("    Sin datos válidos, saltando.")
             continue
 
         cols = [
@@ -183,13 +182,25 @@ def load_early_buyers(engine):
 
 # ── Carga de precios ───────────────────────────────────────────
 
+# Columnas esperadas en los CSVs de la query extendida de Dune.
+# Orden fijo para mantener sincronizados loader.py y create_tables.sql.
+PRICE_COLS = [
+    "coin_address",
+    "price_at_5min", "price_max_4h", "price_min_5min", "price_max_5min",
+    "max_multiple", "label", "label_raw", "rug_detected", "sustained_10min",
+    "sustained_score",
+    "price_t5", "price_t10", "price_t15", "price_t20", "price_t25",
+    "price_t30", "price_t45", "price_t60", "price_t90",
+    "price_t120", "price_t180", "price_t240",
+    "seconds_to_2x", "seconds_to_2_5x",
+    "max_drawdown_1h", "max_drawdown_to_tp",
+]
+
+
 def load_prices(engine):
     """
     Carga prices_YYYYMMDD.csv en coin_prices.
-    Columnas esperadas (query actualizada de Dune):
-        coin_address, price_at_5min, price_max_4h,
-        price_min_5min, price_max_5min, max_multiple,
-        label, label_raw, rug_detected, sustained_10min
+    Todos los CSVs deben haber sido descargados con la query extendida.
     """
     files = sorted(glob.glob("data/raw/prices/prices_2*.csv"))
     if not files:
@@ -207,40 +218,27 @@ def load_prices(engine):
         df = df.drop_duplicates(subset="coin_address")
 
         before = len(df)
-        df = df[df["coin_address"].isin(valid_coins)]
+        df     = df[df["coin_address"].isin(valid_coins)]
         if before - len(df) > 0:
             print(f"    {before - len(df):,} filas descartadas (coin no en BD)")
 
         if df.empty:
             continue
 
-        # Defaults para columnas que pueden faltar
-        for col, default in [
-            ("price_at_5min",   None),
-            ("price_max_4h",    None),
-            ("price_min_5min",  None),
-            ("price_max_5min",  None),
-            ("max_multiple",    None),
-            ("label",           None),
-            ("label_raw",       None),
-            ("rug_detected",    False),
-            ("sustained_10min", None),
-        ]:
-            if col not in df.columns:
-                df[col] = default
+        # Verificar que el CSV tiene todas las columnas esperadas
+        missing = [c for c in PRICE_COLS if c not in df.columns]
+        if missing:
+            print(f"    ⚠ Columnas ausentes: {missing}")
+            print(f"    Asegúrate de usar la query extendida de Dune. Saltando.")
+            continue
 
-        # Convertir rug_detected a bool
+        # Normalizar rug_detected a bool
         df["rug_detected"] = df["rug_detected"].map(
             {True: True, False: False, "true": True, "false": False,
              "True": True, "False": False, 1: True, 0: False}
         ).fillna(False)
 
-        cols = [
-            "coin_address", "price_at_5min", "price_max_4h",
-            "price_min_5min", "price_max_5min", "max_multiple",
-            "label", "label_raw", "rug_detected", "sustained_10min"
-        ]
-        df = df[[c for c in cols if c in df.columns]]
+        df = df[PRICE_COLS]
 
         print(f"  {len(df):,} precios a insertar...")
         with engine.connect() as conn:
@@ -248,14 +246,26 @@ def load_prices(engine):
                 conn,
                 """
                 INSERT INTO coin_prices (
-                    coin_address, price_at_5min, price_max_4h,
-                    price_min_5min, price_max_5min, max_multiple,
-                    label, label_raw, rug_detected, sustained_10min
+                    coin_address,
+                    price_at_5min, price_max_4h, price_min_5min, price_max_5min,
+                    max_multiple, label, label_raw, rug_detected, sustained_10min,
+                    sustained_score,
+                    price_t5, price_t10, price_t15, price_t20, price_t25,
+                    price_t30, price_t45, price_t60, price_t90,
+                    price_t120, price_t180, price_t240,
+                    seconds_to_2x, seconds_to_2_5x,
+                    max_drawdown_1h, max_drawdown_to_tp
                 )
                 VALUES (
-                    :coin_address, :price_at_5min, :price_max_4h,
-                    :price_min_5min, :price_max_5min, :max_multiple,
-                    :label, :label_raw, :rug_detected, :sustained_10min
+                    :coin_address,
+                    :price_at_5min, :price_max_4h, :price_min_5min, :price_max_5min,
+                    :max_multiple, :label, :label_raw, :rug_detected, :sustained_10min,
+                    :sustained_score,
+                    :price_t5, :price_t10, :price_t15, :price_t20, :price_t25,
+                    :price_t30, :price_t45, :price_t60, :price_t90,
+                    :price_t120, :price_t180, :price_t240,
+                    :seconds_to_2x, :seconds_to_2_5x,
+                    :max_drawdown_1h, :max_drawdown_to_tp
                 )
                 ON CONFLICT (coin_address) DO NOTHING
                 """,
@@ -269,7 +279,7 @@ def load_prices(engine):
 # ── Verificación ───────────────────────────────────────────────
 
 def verify(engine):
-    queries = {
+    tables = {
         "coins":          "SELECT COUNT(*) FROM coins",
         "early_buyers":   "SELECT COUNT(*) FROM early_buyers",
         "coin_prices":    "SELECT COUNT(*) FROM coin_prices",
@@ -279,29 +289,27 @@ def verify(engine):
     }
     print()
     with engine.connect() as conn:
-        for table, query in queries.items():
+        for table, query in tables.items():
             n = conn.execute(text(query)).scalar()
             print(f"  {table:<20} {n:>12,} filas")
 
     with engine.connect() as conn:
-        n_label1 = conn.execute(
-            text("SELECT COUNT(*) FROM coin_prices WHERE label = 1")
-        ).scalar()
-        n_label0 = conn.execute(
-            text("SELECT COUNT(*) FROM coin_prices WHERE label = 0")
-        ).scalar()
-        n_null = conn.execute(
-            text("SELECT COUNT(*) FROM coin_prices WHERE label IS NULL")
-        ).scalar()
-        n_rug = conn.execute(
-            text("SELECT COUNT(*) FROM coin_prices WHERE rug_detected = TRUE")
-        ).scalar()
+        n_label1  = conn.execute(text("SELECT COUNT(*) FROM coin_prices WHERE label = 1")).scalar()
+        n_label0  = conn.execute(text("SELECT COUNT(*) FROM coin_prices WHERE label = 0")).scalar()
+        n_null    = conn.execute(text("SELECT COUNT(*) FROM coin_prices WHERE label IS NULL")).scalar()
+        n_rug     = conn.execute(text("SELECT COUNT(*) FROM coin_prices WHERE rug_detected = TRUE")).scalar()
+        n_has_tp  = conn.execute(text("SELECT COUNT(*) FROM coin_prices WHERE seconds_to_2_5x IS NOT NULL")).scalar()
+        n_dd_tp   = conn.execute(text("SELECT COUNT(*) FROM coin_prices WHERE max_drawdown_to_tp > 0.20")).scalar()
 
     print(f"\n  Labels en coin_prices:")
-    print(f"    label=1 (éxito):   {n_label1:>10,}")
-    print(f"    label=0 (fracaso): {n_label0:>10,}")
-    print(f"    label=NULL:        {n_null:>10,}")
-    print(f"    rugs detectados:   {n_rug:>10,}")
+    print(f"    label=1 (éxito):         {n_label1:>10,}")
+    print(f"    label=0 (fracaso):        {n_label0:>10,}")
+    print(f"    label=NULL:               {n_null:>10,}")
+    print(f"    rugs detectados:          {n_rug:>10,}")
+    print(f"\n  Columnas extendidas:")
+    print(f"    Con seconds_to_2_5x:      {n_has_tp:>10,}")
+    print(f"    DD > 20% antes del TP:    {n_dd_tp:>10,}  "
+          f"(stop-loss habría saltado)")
 
 
 # ── Main ───────────────────────────────────────────────────────
